@@ -1,0 +1,77 @@
+/*!
+ * virtual-keyboard.css — programmer virtual keyboard theme (dark, compact, small-screen responsive)
+ * Overrides simple-keyboard base styles: hg-theme-vkb
+ */
+.hg-theme-vkb {
+  --vkb-bg: rgba(24, 26, 32, 0.94);
+  --vkb-key: #3a3f4b;
+  --vkb-key-hi: #4c5464;
+  --vkb-key-fg: #e8eaed;
+  --vkb-mod: #5a4a2a;
+  --vkb-lock: #f0a020;
+  --vkb-border: rgba(255, 255, 255, 0.08);
+  --vkb-h: clamp(30px, 5.5vh, 46px);
+  --vkb-fs: clamp(11px, 2.2vw, 15px);
+
+  background: var(--vkb-bg);
+  border: 1px solid var(--vkb-border);
+  border-radius: 8px;
+  padding: 5px 4px;
+  box-sizing: border-box;
+  font-family: "SF Mono", "Cascadia Code", Consolas, "Noto Sans Mono CJK SC", Menlo, monospace;
+  width: 100%;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+.hg-theme-vkb .hg-row { display: flex; }
+.hg-theme-vkb .hg-row:not(:last-child) { margin-bottom: 4px; }
+.hg-theme-vkb .hg-row .hg-button:not(:last-child),
+.hg-theme-vkb .hg-row .hg-button-container:not(:last-child) { margin-right: 4px; }
+.hg-theme-vkb .hg-button {
+  display: flex;
+  flex-grow: 1;
+  align-items: center;
+  justify-content: center;
+  height: var(--vkb-h);
+  min-width: 0;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border-radius: 5px;
+  border: 1px solid var(--vkb-border);
+  border-bottom: 2px solid rgba(0, 0, 0, 0.35);
+  background: var(--vkb-key);
+  color: var(--vkb-key-fg);
+  font-size: var(--vkb-fs);
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
+}
+.hg-theme-vkb .hg-button:hover { background: var(--vkb-key-hi); }
+.hg-theme-vkb .hg-button:active,
+.hg-theme-vkb .hg-button.hg-activeButton { background: #5b6f9e; }
+.hg-theme-vkb .hg-button.hg-vkb-lock {
+  background: var(--vkb-lock) !important;
+  color: #1a1a1a !important;
+  box-shadow: 0 0 6px rgba(240, 160, 32, 0.6);
+}
+/* modifier key background (Ctrl/Alt/Shift/⊞/caps) */
+.hg-theme-vkb .hg-button-shift,
+.hg-theme-vkb .hg-button-ctrl,
+.hg-theme-vkb .hg-button-alt,
+.hg-theme-vkb .hg-button-meta,
+.hg-theme-vkb .hg-button-capslock { background: var(--vkb-mod); }
+/* width ratios */
+.hg-theme-vkb .hg-button-space { flex-grow: 4; }
+.hg-theme-vkb .hg-button-enter { flex-grow: 2; }
+.hg-theme-vkb .hg-button-shift { flex-grow: 1.4; }
+.hg-theme-vkb .hg-button-bksp,
+.hg-theme-vkb .hg-button-delete,
+.hg-theme-vkb .hg-button-capslock { flex-grow: 1.25; }
+.hg-theme-vkb .hg-button-tab { flex-grow: 1.3; }
+.hg-theme-vkb .hg-button-meta { flex-grow: 1.15; }
+/* panel show/hide */
+.vkb-hidden-root { display: none !important; }

@@ -7,6 +7,16 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #1a1a2e; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+    /* native-keyboard hidden input: inside the toolbar, absolutely positioned offscreen */
+    #nativeKbInput {
+      position: fixed;
+      left: -9999px;
+      top: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
 
     #toolbar {
       background: #16213e;
@@ -43,6 +53,10 @@
     #connectBtn.connected:hover { background: #27ae60; }
     #status { font-size: 12px; color: #aaa; margin-left: 8px; }
 
+    /* fixedTarget mode: hide host/port (target comes from the server / URL param),
+       the user only fills in credentials. standalone mode (no fixedTarget) shows all fields. */
+    html.fixedTarget #hostField, html.fixedTarget #portField { display: none; }
+
     #canvasWrapper {
       flex: 1;
       overflow: auto;
@@ -56,20 +70,62 @@
       cursor: none;
       outline: none;
     }
+
+    /* ── virtual keyboard (small screens / touch devices) ────────────────────────── */
+    #vkbToggle {
+      background: #0f3460;
+      color: #eee;
+      border: 1px solid #444;
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #vkbToggle:hover { background: #1b4a7e; }
+    #vkbToggle.on { background: #2ecc71; color: #111; }
+    #sysKbBtn { background: #0f3460; color: #eee; border: 1px solid #444; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    #sysKbBtn:hover { background: #1b4a7e; }
+    #sysKbBtn.on { background: #3498db; color: #111; }
+    #vkbRoot {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 60;
+      padding: 4px 6px;
+      /* the virtual keyboard's own dark background (rgba); no extra overlay beneath */
+    }
+    body.vkb-open #canvasWrapper {
+      padding-bottom: var(--vkb-hpx, 0px);
+    }
   </style>
+  <link rel="stylesheet" href="vendor/simple-keyboard.css" />
+  <link rel="stylesheet" href="virtual-keyboard.css" />
 </head>
 <body>
+  <script>
+    // ── fixedTarget mode ─────────────────────────────────────────────
+    // The target address is controlled by the server (__rdpTarget injected by
+    // rdp-bridge); the frontend must not be able to tamper with it.
+    // Enters fixedTarget mode (hides host/port) when ANY of:
+    //   1. __rdpTarget exists (injected by rdp-bridge)
+    //   2. URL param ?fixedTarget=true (explicit opt-in)
+    // Neither present = standalone mode: show host/port for free-form connections.
+    (function () {
+      var isFixed = !!(window.__rdpTarget && window.__rdpTarget.host)
+        || /[?&]fixedTarget=true/.test(location.search);
+      if (isFixed) document.documentElement.classList.add("fixedTarget");
+    })();
+  </script>
   <div id="toolbar">
-    <label>Host</label>
-    <input type="text" id="host" value="localhost" placeholder="RDP host" />
-    <label>Port</label>
-    <input type="number" id="port" value="3389" />
-    <label>Domain</label>
-    <input type="text" id="domain" value="" placeholder="(optional)" />
-    <label>User</label>
-    <input type="text" id="user" value="" />
-    <label>Password</label>
-    <input type="password" id="password" value="" />
+    <span id="connFields">
+      <label>Domain</label>
+      <input type="text" id="domain" value="" placeholder="(optional)" />
+      <label>User</label>
+      <input type="text" id="user" value="" />
+      <label>Password</label>
+      <input type="password" id="password" value="" />
+    </span>
     <label>Width</label>
     <input type="number" id="width" value="1280" />
     <label>Height</label>
@@ -78,14 +134,20 @@
       <input type="checkbox" id="swapAltMeta" />
       Swap Alt/Meta
     </label>
+    <!-- xrdp compat is fully automatic: detected via the server's bitmap-codecs capability set, no manual toggle -->
     <button id="connectBtn" onclick="toggleConnect()">Connect</button>
+    <button id="vkbToggle" title="Virtual keyboard (touch / small screens)">⌨️</button>
+    <button id="sysKbBtn" title="System keyboard (native)">⌨️Sys</button>
     <span id="status">Loading WASM…</span>
   </div>
+  <div id="vkbRoot" class="vkb-hidden-root"></div>
+  <input id="nativeKbInput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
   <div id="canvasWrapper">
     <canvas id="rdpCanvas" tabindex="0"></canvas>
   </div>
 
   <script src="wasm_exec.js"></script>
+  <script src="vendor/justget.browser.js"></script>
   <script>
     const go = new Go();
     let connected = false;
@@ -113,10 +175,12 @@
       if (sam !== null) document.getElementById('swapAltMeta').checked = (sam === '1');
     }
     function saveCookies() {
-      for (const id of ['host', 'port', 'domain', 'width', 'height']) {
-        setCookie('rdp_' + id, document.getElementById(id).value.trim());
+      for (const id of ['domain', 'width', 'height']) {
+        const el = document.getElementById(id);
+        if (el) setCookie('rdp_' + id, el.value.trim());
       }
-      setCookie('rdp_swapAltMeta', document.getElementById('swapAltMeta').checked ? '1' : '0');
+      const sm = document.getElementById('swapAltMeta');
+      if (sm) setCookie('rdp_swapAltMeta', sm.checked ? '1' : '0');
     }
     loadCookies();
 
@@ -342,6 +406,21 @@
         console.warn('Unsupported cursor xorBpp:', xorBpp);
       }
 
+      // Mitigation: xrdp color cursors ship an all-zero AND mask -> the whole
+      // rectangle is fully opaque and the cursor shape's (arrow/busy/text…)
+      // transparent outline is lost, rendering as a black block. A real cursor
+      // always has transparent areas (at least the four corners), so detect
+      // "opaque ratio >= 95%" -> discard that cursor and keep the previous
+      // (or default) one.
+      {
+        let opaque = 0, total = w * h;
+        for (let o = 3; o < px.length; o += 4) if (px[o] !== 0) opaque++;
+        if (total > 0 && opaque >= total * 0.95) {
+          console.warn('cursor fully opaque (xrdp AND=0), ignoring', w, 'x', h);
+          return null;
+        }
+      }
+
       octx.putImageData(img, 0, 0);
       // OffscreenCanvas doesn't expose toDataURL; copy through a regular canvas.
       let dataUrl;
@@ -360,15 +439,61 @@
     }
 
     // ── WASM bootstrap ────────────────────────────────────────────────────────
-    WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then(result => {
+    // At runtime main.wasm is race-downloaded from CDNs via justget (the npm tarball
+    // ships the wasm so jsDelivr can serve it, but postinstall removes the local copy
+    // after install — same approach as service-tunnels' face-api models).
+    // Override: URL ?wasm=<url> or localStorage['grdpwasm.wasmUrl']; default CDN -> same-origin fallback.
+    const PKG_VERSION = "0.1.0";
+    function wasmSources() {
+      const custom = new URLSearchParams(location.search).get("wasm")
+        || localStorage.getItem("grdpwasm.wasmUrl");
+      if (custom) return [custom];
+      return [
+        `https://cdn.jsdelivr.net/npm/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
+        `https://unpkg.com/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
+        "main.wasm", // same-origin fallback (local `make serve` / deployments that kept the wasm)
+      ];
+    }
+    async function fetchPlain(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+      return new Uint8Array(await r.arrayBuffer());
+    }
+    async function bootWasm() {
+      const status = document.getElementById("status");
+      const [url, ...mirrors] = wasmSources();
+      const cdnMirrors = mirrors.filter(m => /^https?:/.test(m));
+      let bytes;
+      if (window.justget && window.justget.download && /^https?:/.test(url)) {
+        try {
+          // justget: multi-mirror racing + localStorage learned cache (fastest source becomes primary next time)
+          const result = await window.justget.download({ url, mirrors: cdnMirrors });
+          bytes = result.data instanceof Blob ? new Uint8Array(await result.data.arrayBuffer()) : result.data;
+        } catch { /* all CDNs failed -> same-origin fallback below */ }
+      }
+      if (!bytes) {
+        // try every source sequentially (incl. same-origin main.wasm; CDN sources are retried once — they fail fast)
+        let lastErr;
+        for (const u of [url, ...mirrors]) {
+          try { bytes = await fetchPlain(u); break; } catch (e) { lastErr = e; }
+        }
+        if (!bytes) throw lastErr || new Error("no wasm source");
+      }
+      const result = await WebAssembly.instantiate(bytes, go.importObject);
       go.run(result.instance);
-      document.getElementById("status").textContent = "Ready";
-    }).catch(e => {
+      status.textContent = "Ready";
+    }
+    bootWasm().catch(e => {
       document.getElementById("status").textContent = "WASM load failed: " + e;
     });
 
     function proxyURL() {
-      return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+      // Derive the base path of the current page (e.g. /aiti-ui-env/rdp or /dev/aiti-ui-env/rdp)
+      // so the WS connects to <same base>/ws?target=... (rewritten by the pi-web middleware to rdp-bridge)
+      const base = location.pathname.endsWith("/index.html")
+        ? location.pathname.slice(0, -"/index.html".length)
+        : location.pathname;
+      return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + base;
     }
 
     function toggleConnect() {
@@ -381,8 +506,10 @@
     }
 
     function doConnect() {
-      const host     = document.getElementById("host").value.trim();
-      const port     = document.getElementById("port").value.trim();
+      // host/port: injected by the server via __rdpTarget (fixedTarget mode);
+      // standalone mode reads them from hidden DOM fields (invisible & read-only to the user)
+      const host = (window.__rdpTarget && window.__rdpTarget.host) || document.getElementById("host").value.trim();
+      const port = String((window.__rdpTarget && window.__rdpTarget.port) || document.getElementById("port").value.trim() || 3389);
       const domain   = document.getElementById("domain").value.trim();
       const user     = document.getElementById("user").value.trim();
       const password = document.getElementById("password").value;
@@ -445,6 +572,7 @@
 
     function setDisconnected(msg) {
       connected = false;
+      if (typeof vkb !== "undefined") vkb.reset(); // release locked modifiers
       if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; audioNextAt = 0; }
       if (h264Dec) { try { h264Dec.close(); } catch (_) {} h264Dec = null; }
       h264FramePos.clear();
@@ -508,6 +636,60 @@
         .catch(() => {});
     }
 
+    // ── native (system) keyboard: captured via a hidden input, forwarded to RDP ──
+    const sysKbBtn = document.getElementById("sysKbBtn");
+    const nativeInput = document.getElementById("nativeKbInput");
+    let sysKbActive = false;
+
+    sysKbBtn.addEventListener("click", () => {
+      sysKbActive = !sysKbActive;
+      sysKbBtn.classList.toggle("on", sysKbActive);
+      if (sysKbActive) {
+        // open system keyboard: focus the hidden input; mobile pops up the native keyboard
+        nativeInput.value = "";
+        nativeInput.focus();
+      } else {
+        nativeInput.blur();
+      }
+    });
+
+    // forward native keyboard input to RDP
+    nativeInput.addEventListener("input", () => {
+      if (!connected || !sysKbActive) return;
+      const text = nativeInput.value;
+      if (!text) return;
+      // send characters to RDP one by one
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const code = charToKeyCode(ch);
+        if (code) {
+          rdpKeyDown(code);
+          rdpKeyUp(code);
+        }
+      }
+      nativeInput.value = ""; // clear for the next character
+    });
+
+    // char -> DOM code mapping (common chars; falls back when missing)
+    function charToKeyCode(ch) {
+      const map = {
+        'a':'KeyA','b':'KeyB','c':'KeyC','d':'KeyD','e':'KeyE','f':'KeyF','g':'KeyG',
+        'h':'KeyH','i':'KeyI','j':'KeyJ','k':'KeyK','l':'KeyL','m':'KeyM',
+        'n':'KeyN','o':'KeyO','p':'KeyP','q':'KeyQ','r':'KeyR','s':'KeyS','t':'KeyT',
+        'u':'KeyU','v':'KeyV','w':'KeyW','x':'KeyX','y':'KeyY','z':'KeyZ',
+        '0':'Digit0','1':'Digit1','2':'Digit2','3':'Digit3','4':'Digit4',
+        '5':'Digit5','6':'Digit6','7':'Digit7','8':'Digit8','9':'Digit9',
+        ' ':'Space','-':'Minus','=':'Equal','[':'BracketLeft',']':'BracketRight',
+        '\\':'Backslash',';':'Semicolon',"'":'Quote',',':'Comma','.':'Period','/':'Slash',
+        '`':'Backquote','\n':'Enter','\t':'Tab','\b':'Backspace',
+      };
+      const lower = ch.toLowerCase();
+      if (map[lower]) return map[lower];
+      // uppercase letters
+      if (/^[A-Z]$/.test(ch)) return 'Key' + ch;
+      return null;
+    }
+
     // Sync on click: covers the common case of copying in another app then
     // clicking back into the canvas before pressing the paste key.
     canvas.addEventListener("pointerdown", syncClipboard);
@@ -533,6 +715,38 @@
       e.preventDefault();
       rdpKeyUp(e.code);
     });
+  </script>
+
+  <!-- Virtual keyboard (simple-keyboard engine + programmer layout + unified dispatch layer) -->
+  <script src="vendor/simple-keyboard.js"></script>
+  <script src="virtual-keyboard.js"></script>
+  <script>
+    (function () {
+      if (typeof SimpleKeyboard === "undefined" || typeof VirtualKeyboard === "undefined") return;
+      // mount: send to RDP (Go globals rdpKeyDown/rdpKeyUp map DOM codes to scancodes)
+      const vkb = VirtualKeyboard.mount({
+        root: "#vkbRoot",
+        onKey(code, down) {
+          if (!connected) return;
+          if (down) rdpKeyDown(code); else rdpKeyUp(code);
+        },
+        onLatch(code, on) {
+          if (!connected) return;
+          if (on) rdpKeyDown(code); else rdpKeyUp(code);
+        }
+      });
+      window.vkb = vkb;
+      const btn = document.getElementById("vkbToggle");
+      btn.addEventListener("click", () => {
+        vkb.toggle();
+        btn.classList.toggle("on", vkb.isOpen());
+        document.body.classList.toggle("vkb-open", vkb.isOpen());
+        if (vkb.isOpen()) {
+          const el = document.getElementById("vkbRoot");
+          document.body.style.setProperty("--vkb-hpx", el.offsetHeight + "px");
+        }
+      });
+    })();
   </script>
 </body>
 </html>
