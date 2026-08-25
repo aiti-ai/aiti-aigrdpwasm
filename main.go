@@ -3,11 +3,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
 	"syscall/js"
+	"time"
 
 	"github.com/nakagami/grdp"
 	"github.com/nakagami/grdp/plugin/rdpsnd"
@@ -16,6 +18,7 @@ import (
 var (
 	rdpClient      *grdp.RdpClient
 	clientMu       sync.Mutex
+	connectEpoch   int64 // connection generation: stale async callbacks from old connections must not affect the new session
 	canvas         js.Value
 	ctx2d          js.Value
 	localClipboard string
@@ -38,10 +41,10 @@ func main() {
 	select {}
 }
 
-// jsConnect is called from JS: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height, swapAltMeta)
+// jsConnect is called from JS: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height, swapAltMeta[, noGfx])
 func jsConnect(_ js.Value, args []js.Value) any {
 	if len(args) < 8 {
-		return fmt.Sprintf("usage: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height[, swapAltMeta])")
+		return fmt.Sprintf("usage: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height[, swapAltMeta[, noGfx]])")
 	}
 	proxyWsURL := args[0].String()
 	host := args[1].String()
@@ -56,32 +59,95 @@ func jsConnect(_ js.Value, args []js.Value) any {
 	} else {
 		swapAltMeta = false
 	}
+	noGfx := len(args) >= 10 && args[9].Bool()
 
 	go func() {
-		if err := connect(proxyWsURL, host, port, domain, user, password, width, height); err != nil {
-			slog.Error("connect", "err", err)
-			js.Global().Call("rdpOnError", err.Error())
+		// Auto-negotiation: connect with EGFX first. If the codec the server
+		// actually sends is not decodable by this client (xrdp only sends
+		// progressive/planar — no AVC420 frames within 3s), disconnect and
+		// reconnect once in compat mode (EGFX disabled, legacy bitmaps).
+		// GDS/Windows serve H.264 and are unaffected.
+		noGfxTry := false
+		for attempt := 0; attempt < 2; attempt++ {
+			incompat := make(chan struct{}, 1)
+			err := connect(proxyWsURL, host, port, domain, user, password, width, height, noGfx || noGfxTry, incompat)
+			if err == errIncompatibleGfx {
+				slog.Info("server gfx incompatible — retrying in compat (no-EGFX) mode")
+				setStatusText("xrdp detected: reconnecting in compat mode…")
+				noGfxTry = true
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				slog.Error("connect", "err", err)
+				js.Global().Call("rdpOnError", err.Error())
+				return
+			}
+			// Connected. In auto mode keep listening for a late incompatibility
+			// signal (the verdict point is 3s after the first surface frame,
+			// later than the built-in wait window in connect).
+			if !noGfxTry {
+				select {
+				case <-incompat:
+					slog.Info("server gfx incompatible (late) — retrying in compat (no-EGFX) mode")
+					setStatusText("xrdp detected: reconnecting in compat mode…")
+					noGfxTry = true
+					time.Sleep(300 * time.Millisecond)
+					continue
+				case <-time.After(10 * time.Second):
+					return
+				}
+			}
+			return
 		}
 	}()
 	return nil
 }
 
-func connect(proxyWsURL, host, port, domain, user, password string, width, height int) error {
+// errIncompatibleGfx means the negotiated server GFX codec is not decodable
+// by this client (e.g. xrdp's RFX-progressive); callers should retry in
+// compat (no-EGFX) mode.
+var errIncompatibleGfx = errors.New("incompatible gfx codec negotiated")
+
+func setStatusText(msg string) {
+	js.Global().Get("document").Call("getElementById", "status").Set("textContent", msg)
+}
+
+func connect(proxyWsURL, host, port, domain, user, password string, width, height int, noGfx bool, incompatCh chan struct{}) error {
 	clientMu.Lock()
 	if rdpClient != nil {
 		rdpClient.Close()
 		rdpClient = nil
 	}
+	connectEpoch++
+	myEpoch := connectEpoch
 	clientMu.Unlock()
+	stale := func() bool { return connectEpoch != myEpoch }
 
 	hostPort := host + ":" + port
 
-	// Build WebSocket URL for the proxy: ws://host:port/ws?target=rdphost:3389
-	wsURL := proxyWsURL + "/ws?target=" + hostPort
+	// Build WebSocket URL for the proxy: ws://host:port/ws
+	// The target is never put into the URL: the instance id in the path locates
+	// the bridge, which knows the target from its own config (env); the page HTML
+	// gets window.__rdpTarget injected by the bridge for form pre-fill.
+	wsURL := proxyWsURL + "/ws"
 
 	g := grdp.NewRdpClient(hostPort, width, height, func(hp string) (net.Conn, error) {
 		return dialWebSocket(wsURL)
 	})
+	if noGfx {
+		// Servers like xrdp send EGFX streams this client cannot decode
+		// (progressive garbage); disabling EGFX makes them fall back to
+		// the legacy bitmap path
+		g.DisableGFX()
+	} else if incompatCh != nil {
+		g.OnIncompatibleGfx(func() {
+			select {
+			case incompatCh <- struct{}{}:
+			default:
+			}
+		})
+	}
 
 	// Get canvas from DOM
 	canvas = js.Global().Get("document").Call("getElementById", "rdpCanvas")
@@ -121,14 +187,23 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 
 	g.OnError(func(e error) {
 		slog.Debug("rdp error", "err", e)
+		if stale() {
+			return // stale event from an old connection, ignore
+		}
 		js.Global().Call("rdpOnError", e.Error())
 	}).OnClose(func() {
 		slog.Debug("rdp close")
+		if stale() {
+			return
+		}
 		js.Global().Call("rdpOnClose")
 	}).OnSuccess(func() {
 		slog.Debug("rdp success")
 	}).OnReady(func() {
 		slog.Debug("rdp ready")
+		if stale() {
+			return
+		}
 		js.Global().Call("rdpOnReady")
 	}).OnBitmap(func(bs []grdp.Bitmap) {
 		// Copy bitmap data before rendering (data is borrowed from pool)
@@ -155,6 +230,20 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 
 	if err := g.Login(domain, user, password); err != nil {
 		return err
+	}
+
+	// Auto-negotiation: the GFX caps confirm arrives during/after Login; wait a
+	// short window to classify.
+	//  - incompatibility signal received -> close and let the caller reconnect in compat mode
+	//  - timeout without signal -> server either uses H.264 (continue), or refused
+	//    EGFX and serves legacy bitmaps (continue)
+	if incompatCh != nil {
+		select {
+		case <-incompatCh:
+			g.Close()
+			return errIncompatibleGfx
+		case <-time.After(2 * time.Second):
+		}
 	}
 
 	clientMu.Lock()

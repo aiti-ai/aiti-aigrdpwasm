@@ -5,22 +5,32 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync"
 	"syscall/js"
 	"time"
 )
 
 // wsConn implements net.Conn over a browser WebSocket.
 // It is created by dialWebSocket and injected into grdp via RdpClient.Dialer.
+//
+// Inbound messages use an unbounded queue: the onMessage callback runs on the
+// JS thread — blocking it deadlocks the whole Go runtime — while RDP messages
+// must never be dropped (dropping = stream desync = artifacting/disconnects).
+// So enqueueing never blocks or discards; the Read side consumes at its own
+// pace. Memory growth during bursts stays bounded by the bridge's 32MB
+// backpressure protection.
 type wsConn struct {
 	ws      js.Value
-	readBuf chan []byte
+	mu      sync.Mutex
+	queue   [][]byte
+	notify  chan struct{}
 	pending []byte
 	closed  bool
 }
 
 func dialWebSocket(proxyURL string) (net.Conn, error) {
 	c := &wsConn{
-		readBuf: make(chan []byte, 256),
+		notify: make(chan struct{}, 1),
 	}
 
 	ws := js.Global().Get("WebSocket").New(proxyURL)
@@ -47,18 +57,22 @@ func dialWebSocket(proxyURL string) (net.Conn, error) {
 		arr := js.Global().Get("Uint8Array").New(data)
 		buf := make([]byte, arr.Length())
 		js.CopyBytesToGo(buf, arr)
+		c.mu.Lock()
 		if !c.closed {
-			select {
-			case c.readBuf <- buf:
-			default:
-				// drop if buffer full
-			}
+			c.queue = append(c.queue, buf)
+		}
+		c.mu.Unlock()
+		select {
+		case c.notify <- struct{}{}:
+		default:
 		}
 		return nil
 	})
 	onClose = js.FuncOf(func(this js.Value, args []js.Value) any {
+		c.mu.Lock()
 		c.closed = true
-		close(c.readBuf)
+		c.mu.Unlock()
+		close(c.notify)
 		return nil
 	})
 
@@ -89,15 +103,38 @@ func (c *wsConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	chunk, ok := <-c.readBuf
-	if !ok {
-		return 0, fmt.Errorf("websocket closed")
+	for {
+		c.mu.Lock()
+		if c.closed && len(c.queue) == 0 {
+			c.mu.Unlock()
+			return 0, fmt.Errorf("websocket closed")
+		}
+		var chunk []byte
+		if len(c.queue) > 0 {
+			chunk = c.queue[0]
+			c.queue[0] = nil
+			c.queue = c.queue[1:]
+		}
+		c.mu.Unlock()
+		if chunk != nil {
+			n := copy(b, chunk)
+			if n < len(chunk) {
+				c.pending = chunk[n:]
+			}
+			return n, nil
+		}
+		// queue empty: wait for onMessage notification (notify is closed on Close, so Read returns immediately)
+		_, ok := <-c.notify
+		if !ok {
+			c.mu.Lock()
+			empty := len(c.queue) == 0
+			c.mu.Unlock()
+			if empty {
+				return 0, fmt.Errorf("websocket closed")
+			}
+			continue
+		}
 	}
-	n := copy(b, chunk)
-	if n < len(chunk) {
-		c.pending = chunk[n:]
-	}
-	return n, nil
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
@@ -106,25 +143,22 @@ func (c *wsConn) Write(b []byte) (int, error) {
 	}
 	arr := js.Global().Get("Uint8Array").New(len(b))
 	js.CopyBytesToJS(arr, b)
-	c.ws.Call("send", arr.Get("buffer"))
+	c.ws.Call("send", arr)
 	return len(b), nil
 }
 
 func (c *wsConn) Close() error {
-	if !c.closed {
-		c.closed = true
-		c.ws.Call("close")
-	}
+	c.ws.Call("close")
 	return nil
 }
 
-func (c *wsConn) LocalAddr() net.Addr                { return wsAddr("local") }
-func (c *wsConn) RemoteAddr() net.Addr               { return wsAddr("remote") }
+func (c *wsConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *wsConn) RemoteAddr() net.Addr               { return dummyAddr{} }
 func (c *wsConn) SetDeadline(t time.Time) error      { return nil }
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return nil }
 
-type wsAddr string
+type dummyAddr struct{}
 
-func (a wsAddr) Network() string { return "websocket" }
-func (a wsAddr) String() string  { return string(a) }
+func (dummyAddr) Network() string { return "ws" }
+func (dummyAddr) String() string  { return "websocket" }
