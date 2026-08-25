@@ -1,3 +1,5 @@
 static/main.wasm
 static/wasm_exec.js
 proxy/proxy
+node_modules/
+*.tgz

@@ -1,0 +1,28 @@
+{
+  "name": "@aiti-ai/grdpwasm",
+  "version": "0.1.0",
+  "description": "Web-based RDP client (Go WASM + WebSocket proxy) — browser assets; main.wasm fetched from CDN at runtime via justget",
+  "license": "GPL-3.0",
+  "homepage": "https://github.com/nakagami/grdpwasm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nakagami/grdpwasm.git"
+  },
+  "files": [
+    "static/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "node scripts/sync-version.mjs",
+    "postinstall": "node scripts/postinstall.mjs",
+    "build:vendor": "esbuild node_modules/justget/dist/browser/index.js --bundle --format=iife --global-name=justget --minify --outfile=static/vendor/justget.browser.js"
+  },
+  "dependencies": {
+    "justget": "^0.2.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

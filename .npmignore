@@ -1,0 +1,5 @@
+# The presence of this file makes npm packing ignore .gitignore rules.
+# (.gitignore excludes static/main.wasm to keep it out of git, but the tarball
+# must ship the wasm — otherwise jsDelivr/unpkg would have nothing to serve.
+# The "files" field already limits publishing to static/ + scripts/.)
+*.log
