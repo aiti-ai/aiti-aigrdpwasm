@@ -1,6 +1,8 @@
 package tpkt
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -63,6 +65,8 @@ type TPKT struct {
 	emission.Emitter
 	Conn             *core.SocketLayer
 	ntlm             *nla.NTLMv2
+	clientNonce      []byte // CredSSP clientNonce (CVE-2018-0886 hardening)
+	peerVersion      int    // server CredSSP version (<5 echo path, >=5 hash path)
 	fastPathListener core.FastPathListener
 	ntlmSec          *nla.NTLMv2Security
 }
@@ -149,6 +153,32 @@ func (t *TPKT) StartTLS() error {
 	return t.Conn.StartTLS()
 }
 
+// decrementLE decrements a little-endian integer by 1 (with borrow), used by the CredSSP echo path to verify the server's pubkey+1 (matches FreeRDP ap_integer_decrement_le)
+func decrementLE(b []byte) {
+	for i := 0; i < len(b); i++ {
+		if b[i] == 0 {
+			b[i] = 0xFF
+		} else {
+			b[i]--
+			return
+		}
+	}
+}
+
+// CredSSP binding hash (MS-CSSP version 6 hardened path, consistent with FreeRDP nla.c)
+const (
+	nlaClientServerHashMagic = "CredSSP Client-To-Server Binding Hash\x00"
+	nlaServerClientHashMagic = "CredSSP Server-To-Client Binding Hash\x00"
+)
+
+func credsspBindingHash(magic string, nonce, pubKey []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(magic))
+	h.Write(nonce)
+	h.Write(pubKey)
+	return h.Sum(nil)
+}
+
 func (t *TPKT) StartNLA() error {
 	// Set a deadline for the entire NLA handshake (TLS + NTLM auth)
 	// to prevent hanging indefinitely when the server is slow to respond.
@@ -162,7 +192,8 @@ func (t *TPKT) StartNLA() error {
 		return err
 	}
 	slog.Debug("StartNLA: TLS handshake complete")
-	req := nla.EncodeDERTRequest([]nla.Message{t.ntlm.GetNegotiateMessage()}, nil, nil)
+	t.clientNonce = core.Random(32) // CVE-2018-0886 hardening: fresh per connection, sent with every TSRequest
+	req := nla.EncodeDERTRequest([]nla.Message{t.ntlm.GetNegotiateMessage()}, nil, nil, t.clientNonce)
 	slog.Debug("StartNLA send", "req", core.Hex(req), "len", len(req))
 	_, err = t.Conn.Write(req)
 	if err != nil {
@@ -189,6 +220,7 @@ func (t *TPKT) recvChallenge(data []byte) error {
 		return err
 	}
 	slog.Debug("recvChallenge", "tsreq", tsreq)
+	t.peerVersion = tsreq.Version // CredSSP version negotiation: the server's version picks echo (old) vs hash (hardened) for pubKeyAuth
 	// get pubkey
 	pubkey, err := t.Conn.TlsPubKey()
 	slog.Debug("recvChallenge", "pubkey", core.Hex(pubkey))
@@ -196,8 +228,16 @@ func (t *TPKT) recvChallenge(data []byte) error {
 	authMsg, ntlmSec := t.ntlm.GetAuthenticateMessage(tsreq.NegoTokens[0].Data)
 	t.ntlmSec = ntlmSec
 
-	encryptPubkey := ntlmSec.GssEncrypt(pubkey)
-	req := nla.EncodeDERTRequest([]nla.Message{authMsg}, nil, encryptPubkey)
+	// pubKeyAuth: peerVersion < 5 uses the raw public-key echo path (old xrdp CredSSP), >=5 uses the CVE-2018-0886 hardened hash path
+	var encryptPubkey []byte
+	if t.peerVersion < 5 {
+		slog.Debug("CredSSP echo path (peerVersion<5): pubKeyAuth = GSS_Wap(raw pubkey)")
+		encryptPubkey = ntlmSec.GssEncrypt(pubkey)
+	} else {
+		sum := credsspBindingHash(nlaClientServerHashMagic, t.clientNonce, pubkey)
+		encryptPubkey = ntlmSec.GssEncrypt(sum)
+	}
+	req := nla.EncodeDERTRequest([]nla.Message{authMsg}, nil, encryptPubkey, t.clientNonce)
 	slog.Debug("recvChallenge", "send", core.Hex(req), "len", len(req))
 	_, err = t.Conn.Write(req)
 	if err != nil {
@@ -224,32 +264,38 @@ func (t *TPKT) recvPubKeyInc(data []byte) error {
 		return err
 	}
 	slog.Debug("PubKeyAuth", "key", core.Hex(tsreq.PubKeyAuth))
-	//ignore
-	pubkey := t.ntlmSec.GssDecrypt([]byte(tsreq.PubKeyAuth))
-	slog.Debug("GssDecrypy", "pubkey", core.Hex(pubkey))
+	tlsPubKey, _ := t.Conn.TlsPubKey()
+	decrypted := t.ntlmSec.GssDecrypt([]byte(tsreq.PubKeyAuth))
+	slog.Debug("GssDecrypy", "pubkey", core.Hex(decrypted))
+	// Verify the server's pubKeyAuth: peerVersion<5 uses echo (server returns
+	// pubkey+1, subtract 1 and compare), >=5 uses the hardened hash
+	// (SHA256(ServerClientHashMagic + clientNonce + pubkey))
+	if t.peerVersion < 5 {
+		serverEcho := append([]byte(nil), decrypted...)
+		decrementLE(serverEcho)
+		if !bytes.Equal(serverEcho, tlsPubKey) {
+			return fmt.Errorf("NLA: server public key echo mismatch (MITM or protocol bug)")
+		}
+	} else {
+		expected := credsspBindingHash(nlaServerClientHashMagic, t.clientNonce, tlsPubKey)
+		if !bytes.Equal(decrypted, expected) {
+			return fmt.Errorf("NLA: server public key hash mismatch (MITM or protocol bug)")
+		}
+	}
 	domain, username, password := t.ntlm.GetEncodedCredentials()
 	credentials := nla.EncodeDERTCredentials(domain, username, password)
 	authInfo := t.ntlmSec.GssEncrypt(credentials)
-	req := nla.EncodeDERTRequest(nil, authInfo, nil)
+	req := nla.EncodeDERTRequest(nil, authInfo, nil, t.clientNonce)
 	_, err = t.Conn.Write(req)
 	if err != nil {
 		slog.Debug("send AuthenticateMessage", "err", err)
 		return err
 	}
 
-	// Read the server response right after sending credentials: if the server
-	// rejects them (NLA failure) it closes the connection immediately and Read
-	// returns an error -> surface a clear message instead of a generic
-	// "websocket closed".
-	resp := make([]byte, 1024)
-	t.Conn.SetDeadline(time.Now().Add(5 * time.Second))
-	n, readErr := t.Conn.Read(resp)
-	t.Conn.SetDeadline(time.Time{})
-	if readErr != nil {
-		return fmt.Errorf("NLA authentication failed — check username and password")
-	}
-	_ = n
-
+	// MS-CSSP: authInfo is the last message of the CredSSP handshake — the
+	// server sends no CredSSP-layer response afterwards and goes straight to
+	// RDP/MCS data (handled by the upper-layer "data" event path). Never do a
+	// blocking Read here: waiting would time out and falsely report auth failure.
 	return nil
 }
 

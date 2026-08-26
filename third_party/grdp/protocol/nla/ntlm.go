@@ -280,6 +280,7 @@ func (m *AuthenticateMessage) Serialize() []byte {
 type NTLMv2 struct {
 	domain              string
 	user                string
+	host                string // CredSSP target SPN host name (MsvAvTargetName = "TERMSRV/"+host)
 	password            string
 	respKeyNT           []byte
 	respKeyLM           []byte
@@ -288,6 +289,9 @@ type NTLMv2 struct {
 	authenticateMessage *AuthenticateMessage
 	enableUnicode       bool
 }
+
+// SetHost sets the CredSSP target host name (used for the MsvAvTargetName av-pair)
+func (n *NTLMv2) SetHost(h string) { n.host = h }
 
 func NewNTLMv2(domain, user, password string) *NTLMv2 {
 	return &NTLMv2{
@@ -394,6 +398,11 @@ func (n *NTLMv2) GetAuthenticateMessage(s []byte) (*AuthenticateMessage, *NTLMv2
 
 	serverName := challengeMsg.getTargetName()
 	serverInfo := challengeMsg.getTargetInfo()
+	// CredSSP hardening (CVE-2018-0886): the NTLMv2 blob must append the client
+	// av-pairs after the server targetInfo, otherwise Windows AUTHENTICATE fails
+	// with SEC_E_INTERNAL_ERROR (same as FreeRDP ntlm_av_pairs.c). Order matches
+	// FreeRDP: MsvAvFlags(0x2) -> MsvAvChannelBindings(16 zeroes) -> MsvAvTargetName("TERMSRV/host")
+	authTargetInfo := appendClientAvPairs(serverInfo, n.host)
 	timestamp := challengeMsg.getTargetInfoTimestamp(serverInfo)
 	computeMIC := false
 	if timestamp == nil {
@@ -408,7 +417,7 @@ func (n *NTLMv2) GetAuthenticateMessage(s []byte) (*AuthenticateMessage, *NTLMv2
 	serverChallenge := challengeMsg.ServerChallenge[:]
 	clientChallenge := core.Random(8)
 	ntChallengeResponse, lmChallengeResponse, SessionBaseKey := n.ComputeResponseV2(
-		n.respKeyNT, n.respKeyLM, serverChallenge, clientChallenge, timestamp, serverInfo)
+		n.respKeyNT, n.respKeyLM, serverChallenge, clientChallenge, timestamp, authTargetInfo)
 
 	exchangeKey := SessionBaseKey
 	exportedSessionKey := core.Random(16)
@@ -527,4 +536,39 @@ func (n *NTLMv2Security) GssDecrypt(s []byte) []byte {
 		return nil
 	}
 	return p
+}
+
+// appendClientAvPairs appends the client av-pairs after the server targetInfo
+// (stripping the trailing EOL first), then re-appends the EOL. Matches the
+// client construction in FreeRDP ntlm_av_pairs.c.
+func appendClientAvPairs(serverInfo []byte, host string) []byte {
+	// strip the trailing MsvAvEOL (id=0 len=0, 4 bytes total)
+	trimmed := serverInfo
+	if len(trimmed) >= 4 {
+		// EOL = 00 00 00 00; scan back from the tail to find the last real pair
+		eol := []byte{0x00, 0x00, 0x00, 0x00}
+		if bytes.Equal(trimmed[len(trimmed)-4:], eol) {
+			trimmed = trimmed[:len(trimmed)-4]
+		}
+	}
+	out := make([]byte, 0, len(trimmed)+4+8+16+len("TERMSRV/")+len(host)*2+4)
+	out = append(out, trimmed...)
+	// MsvAvFlags = 0x00000002 (MESSAGE_INTEGRITY_CHECK)
+	out = appendAvPair(out, MsvAvFlags, []byte{0x02, 0x00, 0x00, 0x00})
+	// MsvAvChannelBindings = 16 zero bytes (FreeRDP passes a NULL binding -> all-zero hash)
+	out = appendAvPair(out, MsvChannelBindings, make([]byte, 16))
+	// MsvAvTargetName = "TERMSRV/" + host (UTF-16LE)
+	target := "TERMSRV/" + host
+	out = appendAvPair(out, MsvAvTargetName, core.UnicodeEncode(target))
+	// EOL
+	out = append(out, 0x00, 0x00, 0x00, 0x00)
+	return out
+}
+
+// appendAvPair appends one av-pair (id u16 + len u16 + value)
+func appendAvPair(buf []byte, id uint16, value []byte) []byte {
+	buf = binary.LittleEndian.AppendUint16(buf, id)
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(value)))
+	buf = append(buf, value...)
+	return buf
 }

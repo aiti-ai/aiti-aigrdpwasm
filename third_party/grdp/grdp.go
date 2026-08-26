@@ -446,7 +446,9 @@ func (g *RdpClient) doLogin(routingToken []byte) error {
 	}
 
 	host, _, _ := net.SplitHostPort(g.hostPort)
-	g.tpkt = tpkt.New(core.NewSocketLayer(conn, host), nla.NewNTLMv2(g.domain, g.user, g.password))
+	ntlmSec := nla.NewNTLMv2(g.domain, g.user, g.password)
+	ntlmSec.SetHost(host) // CredSSP target host name (MsvAvTargetName = "TERMSRV/"+host)
+	g.tpkt = tpkt.New(core.NewSocketLayer(conn, host), ntlmSec)
 	g.x224 = x224.New(g.tpkt)
 	g.mcs = t125.NewMCSClient(g.x224, g.kbdLayout, g.keyboardType, g.keyboardSubType)
 	g.sec = sec.NewClient(g.mcs)
