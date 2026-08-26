@@ -3,8 +3,12 @@ PROXY_OUT     = proxy/proxy
 WASM_EXEC_OUT = static/wasm_exec.js
 GOROOT       := $(shell go env GOROOT)
 
-WASM_SRCS  := $(wildcard *.go) go.mod go.sum
-PROXY_SRCS := $(wildcard proxy/*.go) go.mod go.sum
+# NOTE: must include every .go under third_party/grdp, otherwise make thinks the
+# wasm/proxy targets are up-to-date after library edits and skips rebuilding —
+# the browser keeps serving a stale wasm (NLA fixes never take effect).
+GRDP_SRCS  := $(shell find third_party/grdp -name '*.go' 2>/dev/null)
+WASM_SRCS  := $(wildcard *.go) $(GRDP_SRCS) go.mod go.sum
+PROXY_SRCS := $(wildcard proxy/*.go) $(GRDP_SRCS) go.mod go.sum
 
 .PHONY: all clean serve
 
