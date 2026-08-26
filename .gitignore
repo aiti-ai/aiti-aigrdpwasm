@@ -3,3 +3,4 @@ static/wasm_exec.js
 proxy/proxy
 node_modules/
 *.tgz
+cmd/repro/repro
