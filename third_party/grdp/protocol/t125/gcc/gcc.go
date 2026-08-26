@@ -123,6 +123,7 @@ const (
 	RDP_VERSION_10             = 0x00080005
 	RDP_VERSION_10_1           = 0x00080006
 	RDP_VERSION_10_2           = 0x00080007
+	RDP_VERSION_10_12          = 0x0008000C
 )
 
 type Sequence uint16
@@ -255,6 +256,12 @@ type ClientCoreData struct {
 	ConnectionType         uint8          `struc:"uint8"`
 	Pad1octet              uint8          `struc:"uint8"`
 	ServerSelectedProtocol uint32         `struc:"little"`
+	// CS_CORE extension fields (same as FreeRDP; Windows expects them when the block declares length 234)
+	DesktopPhysicalWidth   uint32         `struc:"little"`
+	DesktopPhysicalHeight  uint32         `struc:"little"`
+	DesktopOrientation     uint16         `struc:"little"`
+	DesktopScaleFactor     uint32         `struc:"little"`
+	DeviceScaleFactor      uint32         `struc:"little"`
 }
 
 func NewClientCoreData(kbdLayout uint32, keyboardType uint32, keyboardSubType uint32) *ClientCoreData {
@@ -262,19 +269,47 @@ func NewClientCoreData(kbdLayout uint32, keyboardType uint32, keyboardSubType ui
 	var ClientName [32]byte
 	copy(ClientName[:], core.UnicodeEncode(name)[:])
 	return &ClientCoreData{
-		RDP_VERSION_10_2, 1280, 800, RNS_UD_COLOR_8BPP,
+		RDP_VERSION_10_12, 1280, 800, RNS_UD_COLOR_8BPP,
 		RNS_UD_SAS_DEL, KeyboardLayout(kbdLayout), 22621, ClientName, keyboardType,
 		keyboardSubType, 12, [64]byte{}, RNS_UD_COLOR_8BPP, 1, 0, HIGH_COLOR_24BPP,
 		RNS_UD_15BPP_SUPPORT | RNS_UD_16BPP_SUPPORT | RNS_UD_24BPP_SUPPORT | RNS_UD_32BPP_SUPPORT,
-		RNS_UD_CS_SUPPORT_ERRINFO_PDU | RNS_UD_CS_WANT_32BPP_SESSION | RNS_UD_CS_VALID_CONNECTION_TYPE | RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT,
-		[64]byte{}, uint8(CONNECTION_TYPE_LAN), 0, 0}
+		RNS_UD_CS_SUPPORT_ERRINFO_PDU | RNS_UD_CS_WANT_32BPP_SESSION | RNS_UD_CS_VALID_CONNECTION_TYPE |
+		RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT | RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL,
+		[64]byte{}, uint8(CONNECTION_TYPE_LAN), 0, 0,
+		0, 0, 0, 0, 0}
+}
+
+// PackClientMultitransportData builds the CS_MULTITRANSPORT block (0xC00A, all zeros like FreeRDP)
+func PackClientMultitransportData() []byte {
+	buff := &bytes.Buffer{}
+	core.WriteUInt16LE(0xC00A, buff)
+	core.WriteUInt16LE(8, buff)
+	core.WriteUInt32LE(0, buff)
+	return buff.Bytes()
+}
+
+// PackClientClusterData builds the CS_CLUSTER block (flags match FreeRDP:
+// REDIRECTION_SUPPORTED | REDIRECTED_SESSIONID_FIELD_VALID | REDIRECTION_VERSION3<<2）
+func PackClientClusterData() []byte {
+	buff := &bytes.Buffer{}
+	core.WriteUInt16LE(CS_CLUSTER, buff) // type
+	core.WriteUInt16LE(12, buff)         // length
+	core.WriteUInt32LE(0x0000000D, buff) // ClusterInfoFlags
+	core.WriteUInt32LE(0, buff)          // RedirectedSessionId
+	return buff.Bytes()
 }
 
 func (data *ClientCoreData) Pack() []byte {
 	buff := &bytes.Buffer{}
-	core.WriteUInt16LE(CS_CORE, buff) // 01C0
-	core.WriteUInt16LE(0xd8, buff)    // d800
-	struc.Pack(buff, data)
+	body := &bytes.Buffer{}
+	struc.Pack(body, data)
+	core.WriteUInt16LE(CS_CORE, buff)
+	// Declared length matches FreeRDP (234); the actual serialization is ~230
+	// bytes and Windows skips blocks by the declared length. NOTE: the old
+	// hardcoded 0xd8 mismatched the real write, misaligning blocks under
+	// Windows' strict parser -> disconnect.
+	core.WriteUInt16LE(234, buff)
+	buff.Write(body.Bytes())
 	return buff.Bytes()
 }
 
@@ -334,6 +369,11 @@ func NewClientSecurityData() *ClientSecurityData {
 	return &ClientSecurityData{
 		ENCRYPTION_FLAG_40BIT | ENCRYPTION_FLAG_56BIT | ENCRYPTION_FLAG_128BIT,
 		00}
+}
+
+// SetEncryptionMethods sets the negotiation result: standard encryption is unused under TLS/NLA (FreeRDP sends 0)
+func (d *ClientSecurityData) SetEncryptionMethods(enc uint32) {
+	d.EncryptionMethods = enc
 }
 
 func (d *ClientSecurityData) Pack() []byte {

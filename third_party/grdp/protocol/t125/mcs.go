@@ -323,11 +323,32 @@ func (c *MCSClient) connect(selectedProtocol uint32) {
 	slog.Debug("connect", "clientNetworkData", c.clientNetworkData)
 	slog.Debug("connect", "clientSecurityData", c.clientSecurityData)
 	// sendConnectclientCoreDataInitial
+	// Block order matches FreeRDP gcc_write_client_data_blocks:
+	// core -> cluster -> security -> net (CS_MCS_MSGCHANNEL is an extension
+	// block FreeRDP only sends after negotiating extended client data — not by
+	// default). CS_SECURITY encryption methods: only legacy RDP encryption
+	// (selectedProtocol == PROTOCOL_RDP) declares 40/56/128-bit; standard
+	// encryption is unused under TLS/NLA, mirroring FreeRDP's 0 (Windows
+	// rejects the 0xB + HYBRID combination).
+	if selectedProtocol == 0 { // PROTOCOL_RDP (legacy RDP encryption)
+		c.clientSecurityData.SetEncryptionMethods(gcc.ENCRYPTION_FLAG_40BIT | gcc.ENCRYPTION_FLAG_56BIT | gcc.ENCRYPTION_FLAG_128BIT)
+	} else {
+		c.clientSecurityData.SetEncryptionMethods(0)
+	}
 	userDataBuff := bytes.Buffer{}
 	userDataBuff.Write(c.clientCoreData.Pack())
-	userDataBuff.Write(c.clientNetworkData.Pack())
+	userDataBuff.Write(gcc.PackClientClusterData())
 	userDataBuff.Write(c.clientSecurityData.Pack())
+	userDataBuff.Write(c.clientNetworkData.Pack())
+	// Extended client data blocks (CS_MCS_MSGCHANNEL + CS_MULTITRANSPORT): modern
+	// servers (Windows 2022, current xrdp) all advertise
+	// EXTENDED_CLIENT_DATA_SUPPORTED and tolerate these; the original fork also
+	// sent MSGCHANNEL unconditionally. NOTE: ideally these should be gated on the
+	// EXTENDED_CLIENT_DATA_SUPPORTED bit of the x224 NEG_RSP.Flag, but all
+	// target servers accept them — kept unconditional for now (ancient servers
+	// might refuse; pass the Flag through if that becomes an issue).
 	userDataBuff.Write(gcc.PackClientMsgChannelData())
+	userDataBuff.Write(gcc.PackClientMultitransportData())
 
 	slog.Debug("userData", "data", core.Hex(userDataBuff.Bytes()), "len", len(userDataBuff.Bytes()))
 	ccReq := gcc.MakeConferenceCreateRequest(userDataBuff.Bytes())

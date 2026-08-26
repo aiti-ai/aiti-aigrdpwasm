@@ -291,7 +291,7 @@ func (c *Client) sendConfirmActivePDU() {
 	inputCapa.KeyboardLayout = c.clientCoreData.KbdLayout
 	inputCapa.KeyboardType = c.clientCoreData.KeyboardType
 	inputCapa.KeyboardSubType = c.clientCoreData.KeyboardSubType
-	inputCapa.KeyboardFunctionKey = c.clientCoreData.KeyboardFnKeys
+	inputCapa.KeyboardFunctionKey = uint32(c.clientCoreData.KeyboardFnKeys)
 	inputCapa.ImeFileName = c.clientCoreData.ImeFileName
 
 	glyphCapa := c.clientCapabilities[CAPSTYPE_GLYPHCACHE].(*GlyphCapability)

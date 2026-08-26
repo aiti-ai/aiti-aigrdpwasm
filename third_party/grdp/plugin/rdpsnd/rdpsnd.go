@@ -18,7 +18,9 @@ import (
 const (
 	ChannelName   = plugin.RDPSND_SVC_CHANNEL_NAME
 	ChannelOption = plugin.CHANNEL_OPTION_INITIALIZED |
-		plugin.CHANNEL_OPTION_ENCRYPT_RDP
+		plugin.CHANNEL_OPTION_ENCRYPT_RDP |
+		plugin.CHANNEL_OPTION_COMPRESS_RDP |
+		plugin.CHANNEL_OPTION_SHOW_PROTOCOL
 )
 
 // RDPSND PDU types (MS-RDPEA 2.2)

@@ -14,7 +14,7 @@ import (
 const (
 	ChannelName   = plugin.DRDYNVC_SVC_CHANNEL_NAME
 	ChannelOption = plugin.CHANNEL_OPTION_INITIALIZED |
-		plugin.CHANNEL_OPTION_ENCRYPT_RDP
+		plugin.CHANNEL_OPTION_COMPRESS_RDP
 )
 
 const (

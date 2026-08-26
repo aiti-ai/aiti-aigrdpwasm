@@ -125,13 +125,33 @@ func ReadInteger(r io.Reader) (int, error) {
 
 func WriteInteger(n int, w io.Writer) {
 	WriteUniversalTag(TAG_INTEGER, false, w)
-	if n <= 0xff {
+	// DER INTEGER is signed: when the high bit of the first byte is set, prefix
+	// 0x00, otherwise 0xFFFF would parse as -1 (Windows enforces this strictly
+	// and drops the connection; xrdp is lenient and unaffected)
+	switch {
+	case n >= 0 && n <= 0x7f:
 		WriteLength(1, w)
 		core.WriteUInt8(uint8(n), w)
-	} else if n <= 0xffff {
+	case n >= 0 && n <= 0xff:
+		WriteLength(2, w)
+		core.WriteUInt8(0, w)
+		core.WriteUInt8(uint8(n), w)
+	case n >= 0 && n <= 0x7fff:
 		WriteLength(2, w)
 		core.WriteUInt16BE(uint16(n), w)
-	} else {
+	case n >= 0 && n <= 0xffff:
+		WriteLength(3, w)
+		core.WriteUInt8(0, w)
+		core.WriteUInt16BE(uint16(n), w)
+	case n >= 0 && n <= 0x7fffffff:
+		WriteLength(4, w)
+		core.WriteUInt32BE(uint32(n), w)
+	case n >= 0:
+		WriteLength(5, w)
+		core.WriteUInt8(0, w)
+		core.WriteUInt32BE(uint32(n), w)
+	default:
+		// n < 0: never seen for MCS domain parameters; theoretical safeguard
 		WriteLength(4, w)
 		core.WriteUInt32BE(uint32(n), w)
 	}
