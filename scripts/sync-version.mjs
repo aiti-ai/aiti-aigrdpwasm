@@ -20,5 +20,4 @@ const next = src.replace(
   `const PKG_VERSION = "${version}";`
 );
 if (next !== src) writeFileSync(html, next);
-writeFileSync(html, next);
 console.log(`[grdpwasm] index.html PKG_VERSION -> ${version}`);
