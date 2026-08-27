@@ -579,15 +579,18 @@ func (g *RdpClient) doLogin(routingToken []byte) error {
 	if g.onIncompatGfxFn != nil {
 		gfxHandler.SetIncompatibleGfxCallback(g.onIncompatGfxFn)
 	}
+	// The RDPGFX DVC handler is ALWAYS registered, even in gfxDisabled mode:
+	// gnome-remote-desktop ignores the DYNVC-GFX EarlyCapabilityFlag and
+	// proactively creates the RDPGFX channel — a hard rejection (E_FAIL)
+	// makes it terminate the whole session with ERRINFO_BAD_CAPABILITIES.
+	// With the handler in place the codec fallback happens at the caps layer:
+	// CAPS_ADVERTISE is legacy-only when gfxDisabled (see rdpgfx), so the
+	// server never gets an AVC codec grant and falls back on its own.
+	// (xrdp needs the handler too: it deadlocks waiting for caps otherwise.)
+	g.gfxHandler = gfxHandler
+	dvcClient.RegisterHandler(rdpgfx.ChannelName, gfxHandler)
 	if g.gfxDisabled {
-		// Reject the RDPGFX DVC entirely: when the server (e.g. xrdp)
-		// proactively creates the EGFX channel it must fall back to legacy
-		// bitmap PDUs instead of waiting for caps that never match.
-		dvcClient.RegisterRejectedChannel(rdpgfx.ChannelName)
-		slog.Debug("RDPGFX: channel rejection registered (DisableGFX)")
-	} else {
-		g.gfxHandler = gfxHandler
-		dvcClient.RegisterHandler(rdpgfx.ChannelName, gfxHandler)
+		slog.Debug("RDPGFX: handler registered (DisableGFX — caps will be legacy-only)")
 	}
 
 	// RDPEDISP (Display Update Virtual Channel) handler — allows requesting
