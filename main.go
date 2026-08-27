@@ -135,6 +135,11 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	g := grdp.NewRdpClient(hostPort, width, height, func(hp string) (net.Conn, error) {
 		return dialWebSocket(wsURL)
 	})
+	// The WASM page decodes H.264 with a single-stream WebCodecs decoder
+	// (rdpOnH264 → one VideoDecoder). AVC444/LC=2 is a dual-stream codec —
+	// drawing only the main stream garbles the chroma. Advertise AVC420
+	// exclusively so the server never sends LC=2 data.
+	g.DisableAVC444()
 	if noGfx {
 		// Servers like xrdp send EGFX streams this client cannot decode
 		// (progressive garbage); disabling EGFX makes them fall back to
