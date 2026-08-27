@@ -265,6 +265,7 @@
         },
         error(e) {
           console.warn('WebCodecs H.264 decoder error:', e);
+          window.__avcErr = (window.__avcErr || 0) + 1;
         }
       });
       decoder.configure({
@@ -505,7 +506,7 @@
       }
     }
 
-    function doConnect() {
+    async function doConnect() {
       // host/port: injected by the server via __rdpTarget (fixedTarget mode);
       // standalone mode reads them from hidden DOM fields (invisible & read-only to the user)
       const host = (window.__rdpTarget && window.__rdpTarget.host) || document.getElementById("host").value.trim();
@@ -519,14 +520,36 @@
       saveCookies();
 
       // (Re)create the H.264 decoder sized for this session.
+      // Probe ACTUAL decode support first: headless browsers may expose the
+      // WebCodecs API yet ship no H.264 codec — every AVC420 frame would then
+      // fail at runtime ("Operation is not supported"), the surface would
+      // never receive its keyframes, and the screen would stay garbled. When
+      // H.264 is unusable we connect in noGfx mode so the server falls back to
+      // legacy bitmap/ClearCodec-only rendering, which always works.
+      let avcUsable = false;
+      if (h264Supported()) {
+        try {
+          const sup = await VideoDecoder.isConfigSupported({ codec: 'avc1.42E01E', codedWidth: width, codedHeight: height });
+          avcUsable = !!sup.supported;
+        } catch (_) { avcUsable = false; }
+      }
       if (h264Dec) { try { h264Dec.close(); } catch (_) {} }
-      h264Dec = createH264Decoder(width, height);
+      h264Dec = avcUsable ? createH264Decoder(width, height) : null;
       h264Timestamp = 0;
       h264FramePos.clear();
 
       // Reset cursor state for the new session.
       pointerCache.clear();
       canvas.style.cursor = 'default';
+
+      // Size the canvas backing store up-front and paint an opaque background.
+      // ClearCodec/RDPGFX frames are incremental; regions never covered must
+      // stay opaque (transparent holes render as garbage on some browsers).
+      canvas.width = width;
+      canvas.height = height;
+      ctx2d = canvas.getContext('2d');
+      ctx2d.fillStyle = '#000000';
+      ctx2d.fillRect(0, 0, width, height);
 
       // Create AudioContext here, while we're in a user-gesture handler,
       // so the browser starts it in 'running' state (no autoplay suspension).
@@ -538,8 +561,11 @@
       } else {
         document.getElementById("status").textContent = "Connecting… (WebCodecs unavailable)";
       }
+      // Debug: ?nogfx=1 disables the EGFX pipeline (server falls back to
+      // legacy bitmap PDUs) — used to isolate graphics-pipeline issues.
+      const urlNoGfx = new URLSearchParams(location.search).has("nogfx");
       rdpConnect(proxyURL(), host, port, domain, user, password, width, height,
-        document.getElementById("swapAltMeta").checked);
+        document.getElementById("swapAltMeta").checked, urlNoGfx || !avcUsable);
     }
 
     // Callbacks from WASM

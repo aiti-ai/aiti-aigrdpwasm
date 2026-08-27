@@ -282,7 +282,7 @@ func renderBitmaps(bs []grdp.Bitmap) {
 					dst[col*4+0] = src[col*4+2] // R ← BGRA[2]
 					dst[col*4+1] = src[col*4+1] // G
 					dst[col*4+2] = src[col*4+0] // B ← BGRA[0]
-					dst[col*4+3] = src[col*4+3] // A
+					dst[col*4+3] = 0xFF        // A (forced opaque: NSCodec/AVC paths leave alpha=0 → transparent holes)
 				}
 			}
 		} else {
@@ -298,8 +298,9 @@ func renderBitmaps(bs []grdp.Bitmap) {
 		jsArr := uint8ClampedCtor.New(len(rgba))
 		js.CopyBytesToJS(jsArr, rgba)
 		imageData := imageDataCtor.New(jsArr, w, h)
+		js.Global().Get("console").Call("log", "PUTIMG", bm.DestLeft, bm.DestTop, bm.DestRight, bm.DestBottom, w, h, len(bm.Data))
 		ctx2d.Call("putImageData", imageData, bm.DestLeft, bm.DestTop)
-	}
+		}
 }
 
 func jsDisconnect(_ js.Value, _ []js.Value) any {

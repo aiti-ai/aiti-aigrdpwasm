@@ -1,6 +1,7 @@
 package tpkt
 
 import (
+	"os"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
@@ -111,6 +112,9 @@ func (t *TPKT) readLoop() {
 			if _, err := io.ReadFull(t.Conn, body); err != nil {
 				t.Emit("error", err)
 				return
+			}
+			if os.Getenv("RDP_DUMP_TPKT") != "" {
+				slog.Debug("TPKT X224 frame", "len", len(body), "head", core.Hex(body[:min(48, len(body))]))
 			}
 			t.Emit("data", body)
 			releaseReadBuf(body)
