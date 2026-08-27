@@ -214,13 +214,18 @@ type AuthenticateMessage struct {
 	EncryptedRandomSessionMaxLen       uint16   `struc:"little"`
 	EncryptedRandomSessionBufferOffset uint32   `struc:"little"`
 	NegotiateFlags                     uint32   `struc:"little"`
-	Version                            NVersion `struc:"little"`
-	MIC                                [16]byte `struc:"little"`
+	Version                            NVersion `struc:"skip"`
+	MIC                                [16]byte `struc:"skip"`
 	Payload                            []byte   `struc:"skip"`
 }
 
 func (m *AuthenticateMessage) BaseLen() uint32 {
-	return 88
+	// 88 = base without Version (80) + 8-byte Version; only include the Version
+	// field when the server negotiated NTLMSSP_NEGOTIATE_VERSION.
+	if (m.NegotiateFlags & NTLMSSP_NEGOTIATE_VERSION) != 0 {
+		return 88
+	}
+	return 80
 }
 
 func NewAuthenticateMessage(negFlag uint32, domain, user, workstation []byte,
@@ -272,7 +277,14 @@ func NewAuthenticateMessage(negFlag uint32, domain, user, workstation []byte,
 
 func (m *AuthenticateMessage) Serialize() []byte {
 	buff := &bytes.Buffer{}
-	struc.Pack(buff, m)
+	struc.Pack(buff, m) // fixed region (Signature..NegotiateFlags); Version/MIC/Payload are `skip`
+	// Version field is only present when the server negotiated NTLMSSP_NEGOTIATE_VERSION
+	// (gnome-remote-desktop omits it; including it shifts MIC/payload offsets and breaks
+	// the Message Integrity Check). Order must stay: fixed region -> Version? -> MIC -> Payload.
+	if (m.NegotiateFlags & NTLMSSP_NEGOTIATE_VERSION) != 0 {
+		struc.Pack(buff, m.Version)
+	}
+	buff.Write(m.MIC[:])
 	buff.Write(m.Payload)
 	return buff.Bytes()
 }
