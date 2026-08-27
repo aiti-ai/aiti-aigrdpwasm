@@ -884,8 +884,13 @@ func (g *GfxHandler) sendCapsAdvertise() {
 	// reject RDPGFX and use legacy bitmap PDUs.
 	if g.h264dec != nil || g.onH264Raw != nil {
 		if g.avc444Disabled {
-			// AVC444 disabled: advertise only v8.0 and v8.1 so the server
-			// uses AVC420 (4:2:0) exclusively and never sends LC=2 data.
+			// AVC444 disabled: advertise ONLY v8.0 + v8.1(AVC420). Windows
+			// Server 2022 sends ClearCodec-incrementals on this profile
+			// (stable). Note: adding v10.x capsets with AVC_DISABLED alongside
+			// v8.1 AVC420_ENABLED makes Windows drop the connection instantly
+			// (contradictory AVC declarations), and plain v10.x without
+			// AVC_DISABLED selects dual-stream AVC444v2 (chroma garbling on
+			// single-stream decoders) — both verified experimentally.
 			p = binary.LittleEndian.AppendUint16(p, 2) // capsSetCount
 
 			// v8.0 — baseline fallback (no AVC)
@@ -1568,7 +1573,7 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// bands / subcodecs (RAW + NSCodec + RLEX). Fixes Windows 8.1+ which
 		// prefers ClearCodec for UI surfaces — without decoding it the client
 		// black-screens and the server drops the session.
-		decoded = g.clearCtx.decode(bmpData, w, h)
+		decoded = g.clearCtx.decodeInto(bmpData, w, h, s.data, int(s.width), int(s.height), int(left), int(top))
 		owned = true
 	case codecProgressive:
 		// progressive decoding garbles xrdp-encoded streams — but GDS may also send
@@ -2413,13 +2418,43 @@ func decodePlanarPlane(data []byte, offset, w, h int) ([]byte, int) {
 
 // --- Codec: ClearCodec (MS-RDPEGFX 2.2.4) ---
 
-func (ctx *clearCodecCtx) decode(data []byte, w, h int) []byte {
+// decodeInto decodes a ClearCodec frame directly against the surface: the
+// output starts from the surface's current pixels for the target region, so
+// any pixel not covered by this frame's residual/bands/subcodec segments
+// keeps the previously shown content (Windows sends ClearCodec frames that
+// only partially cover their declared rect). The merged region is written
+// back to the surface and returned for canvas blitting.
+func (ctx *clearCodecCtx) decodeInto(data []byte, w, h int, surfData []byte, surfW, surfH, left, top int) []byte {
 	out := make([]byte, w*h*4)
+	stride := surfW * 4
+	inBounds := surfW > 0 && surfH > 0 && left >= 0 && top >= 0 &&
+		left+w <= surfW && top+h <= surfH
+	if inBounds {
+		for row := 0; row < h; row++ {
+			srcOff := (top+row)*stride + left*4
+			if srcOff >= 0 && srcOff+w*4 <= len(surfData) {
+				copy(out[row*w*4:(row+1)*w*4], surfData[srcOff:srcOff+w*4])
+			}
+		}
+	}
+	ctx.decodeIntoBuf(data, w, h, out)
+	if inBounds {
+		for row := 0; row < h; row++ {
+			dstOff := (top+row)*stride + left*4
+			if dstOff >= 0 && dstOff+w*4 <= len(surfData) {
+				copy(surfData[dstOff:dstOff+w*4], out[row*w*4:(row+1)*w*4])
+			}
+		}
+	}
+	return out
+}
+
+func (ctx *clearCodecCtx) decodeIntoBuf(data []byte, w, h int, out []byte) {
 	// WTS1 bitmapData layout: glyphFlags(1) + seqNumber(1), then the ClearCodec
 	// composition payload (residual/bands/subcodec counts + data). Skip the
 	// 2-byte prefix; glyph segments are not used by current servers.
 	if len(data) < 14 {
-		return out
+		return
 	}
 	// Direct binary indexing — avoids bytes.NewReader and per-field interface dispatch.
 	residualLen := int(binary.LittleEndian.Uint32(data[2:]))
@@ -2438,7 +2473,6 @@ func (ctx *clearCodecCtx) decode(data []byte, w, h int) []byte {
 	if subcodecLen > 0 && off >= 0 && off+subcodecLen <= len(data) {
 		decodeSubcodec(data[off:off+subcodecLen], w, out)
 	}
-	return out
 }
 
 // decodeResidual decodes a ClearCodec residual segment: a run-length stream of
@@ -2670,7 +2704,7 @@ var clearLog2Floor = func() [256]uint8 {
 // clear8BitMasks matches FreeRDP CLEAR_8BIT_MASKS[9].
 var clear8BitMasks = [9]uint8{0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF}
 
-// blitBGRA copies a BGRA buffer into out at (xStart,yStart). 
+// blitBGRA copies a BGRA buffer into out at (xStart,yStart).
 func blitBGRA(src []byte, w, h, xStart, yStart, surfW int, out []byte) {
 	rowDst := surfW * 4
 	for y := 0; y < h; y++ {
