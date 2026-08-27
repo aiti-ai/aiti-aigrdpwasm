@@ -287,6 +287,7 @@
 
     // Called from Go/WASM with raw H.264 NAL unit data.
     function rdpOnH264(destX, destY, w, h, isKey, uint8Data) {
+      window.__h264Seen = (window.__h264Seen || 0) + 1;
       if (!h264Dec || h264Dec.state === 'closed') return;
       h264Timestamp += 1000; // 1 ms apart (decoder uses μs)
       h264FramePos.set(h264Timestamp, { x: destX, y: destY });
@@ -585,13 +586,104 @@
       document.getElementById("status").textContent =
         h264Dec ? "Connected (WebCodecs H.264)" : "Connected";
       document.getElementById("rdpCanvas").focus();
+      startGfxQualityWatchdog();
+    }
+
+    // ── Automatic noGFX fallback watchdog ─────────────────────────────────────
+    // The AVC420 capability profile does not work reliably with every server:
+    // a server may answer with dual-stream AVC444 (chroma garbling on a
+    // single-stream WebCodecs decoder) or switch to sparse ClearCodec
+    // incrementals (desktop never fully materialises). Both leave the screen
+    // unusable without any decoder error ever firing. Sample the canvas once
+    // after the session had time to render; if it still looks broken,
+    // transparently reload in noGFX mode (legacy bitmap rendering) — no user
+    // action required. Armed only in AVC420 sessions on non-nogfx pages so
+    // the fallback itself never loops.
+    function reloadNoGfx(reason) {
+      if (/[?&]nogfx=1/.test(location.search)) return false;
+      console.warn('gfx quality watchdog:', reason, '— reloading in noGFX (legacy bitmap) mode');
+      // Stash credentials for the seamless auto-reconnect after the reload
+      // (sessionStorage: cleared when the tab closes, never persisted).
+      try {
+        sessionStorage.setItem('rdpAutoFallbackCreds', JSON.stringify({
+          u: document.getElementById('user').value,
+          p: document.getElementById('password').value,
+        }));
+      } catch (_) {}
+      const sep = location.search ? location.search + '&nogfx=1' : '?nogfx=1';
+      location.href = location.pathname + sep;
+      return true;
+    }
+
+    function startGfxQualityWatchdog() {
+      if (!h264Dec || /[?&]nogfx=1/.test(location.search)) return;
+      setTimeout(() => {
+        if (!connected) return;
+        const c = document.getElementById('rdpCanvas');
+        if (!c) return;
+        const ctx = c.getContext('2d');
+        let d;
+        try { d = ctx.getImageData(0, 0, c.width, c.height).data; } catch (_) { return; }
+        const colors = new Set();
+        let greenMagenta = 0, sampled = 0;
+        for (let j = 0; j < d.length; j += 16) { // sample every 4th pixel
+          const r = d[j], g = d[j+1], b = d[j+2];
+          colors.add((r<<16)|(g<<8)|b);
+          sampled++;
+          // Saturated pure green / magenta = classic dual-stream YUV mismatch
+          if ((g > 180 && r < 80 && b < 80) || (r > 180 && b > 180 && g < 80)) greenMagenta++;
+        }
+        const gmPct = sampled ? greenMagenta / sampled : 0;
+        const h264Seen = window.__h264Seen || 0;
+        if (gmPct > 0.25) {
+          reloadNoGfx('saturated green/magenta on ' + Math.round(gmPct*100) + '% of pixels (dual-stream chroma mismatch)');
+          return;
+        }
+        // Declared AVC420 but not a single H.264 frame arrived: the server
+        // answered the caps with a non-AVC profile (sparse ClearCodec
+        // incrementals) whose coverage never materialises a full desktop.
+        // A healthy AVC session always delivers at least the initial
+        // keyframe within this window.
+        if (h264Seen === 0) {
+          reloadNoGfx('AVC420 session produced no H.264 frames in 25s (server fell back to sparse ClearCodec)');
+          return;
+        }
+        console.log('gfx quality watchdog: OK (' + colors.size + ' colors, h264 frames: ' + h264Seen + ')');
+      }, 25000);
     }
 
     function rdpOnError(msg) {
       setDisconnected("Error: " + msg);
     }
 
+    // Seamless auto-reconnect after the noGFX fallback reload: if the
+    // watchdog stashed credentials, refill the form and connect immediately
+    // (no user action needed for the whole AVC420 → legacy downgrade).
+    try {
+      const fallbackCreds = sessionStorage.getItem('rdpAutoFallbackCreds');
+      if (fallbackCreds && /[?&]nogfx=1/.test(location.search)) {
+        sessionStorage.removeItem('rdpAutoFallbackCreds');
+        const creds = JSON.parse(fallbackCreds);
+        const userEl = document.getElementById('user');
+        const passEl = document.getElementById('password');
+        if (userEl && passEl && creds.u) {
+          userEl.value = creds.u;
+          passEl.value = creds.p || '';
+          if (typeof doConnect === 'function') {
+            setTimeout(() => { doConnect(); }, 300);
+          }
+        }
+      }
+    } catch (_) {}
+
     function rdpOnClose() {
+      // A server-side drop on an AVC420 session (frame-ack stalls, codec
+      // profile disagreements) does not recover on retry with the same
+      // profile. Reconnect once in noGFX mode automatically; in noGFX mode
+      // already (or user-initiated Disconnect), just report.
+      if (connected && !/[?&]nogfx=1/.test(location.search) && reloadNoGfx('server closed an AVC420 session')) {
+        return;
+      }
       setDisconnected("Closed");
     }
 
