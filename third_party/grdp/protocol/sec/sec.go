@@ -139,14 +139,46 @@ func NewExtendedInfo(auto *ClientAutoReconnect) *RDPExtendedInfo {
 		ClientAddressFamily: AF_INET,
 		ClientAddress:       []byte{0, 0},
 		ClientDir:           []byte{0, 0},
-		ClientTimeZone:      make([]byte, 172),
-		ClientSessionId:     0,
-		PerformanceFlags: (PERF_DISABLE_FULLWINDOWDRAG |
-			PERF_DISABLE_WALLPAPER |
-			PERF_DISABLE_MENUANIMATIONS |
-			PERF_ENABLE_FONT_SMOOTHING |
-			PERF_ENABLE_DESKTOP_COMPOSITION),
-		AutoReconnect: auto,
+		// A valid TIME_ZONE_INFORMATION is required: Windows Server 2022
+		// rejects an all-zero (172-byte) time zone with SetErrorInfo
+		// (0x0000111B) and drops the session right after the Client Info PDU.
+		// Use China Standard Time (UTC+8, no DST) as a sane default.
+		ClientTimeZone: buildTimeZone(-480, "China Standard Time", "China Daylight Time"),
+		// FreeRDP sends performanceFlags=0 by default; non-zero values only
+		// change cosmetic behaviour anyway.
+		PerformanceFlags: 0,
+		AutoReconnect:    auto,
+	}
+}
+
+// buildTimeZone constructs a 172-byte TIME_ZONE_INFORMATION blob
+// (MS-RDPBCGR 2.2.1.11.1.1.1) with the given bias (minutes, UTC = local + bias)
+// and UTF-16 standard/daylight names. DST transition dates are left zeroed
+// (no daylight saving), which Windows accepts.
+func buildTimeZone(biasMinutes int16, stdName, daylightName string) []byte {
+	b := make([]byte, 172)
+	binary.LittleEndian.PutUint16(b[0:2], uint16(biasMinutes))
+	// Bias 2 bytes + StandardDate 16 bytes → StandardName at offset 4? No:
+	// layout is Bias(4) + StandardName(64) + StandardDate(16) + StandardBias(4)
+	// + DaylightName(64) + DaylightDate(16) + DaylightBias(4) = 172.
+	// Bias is actually 4 bytes (LONG).
+	binary.LittleEndian.PutUint32(b[0:4], uint32(int32(biasMinutes)))
+	putUTF16Fixed(b[4:68], stdName)   // StandardName: 32 WCHARs
+	// StandardDate (offset 68, 16 bytes) stays zeroed → no DST.
+	binary.LittleEndian.PutUint32(b[84:88], 0) // StandardBias
+	putUTF16Fixed(b[88:152], daylightName)     // DaylightName: 32 WCHARs
+	// DaylightDate (offset 152, 16 bytes) stays zeroed.
+	binary.LittleEndian.PutUint32(b[168:172], 0) // DaylightBias
+	return b
+}
+
+// putUTF16Fixed writes s as UTF-16LE into buf (NUL padded, truncated to fit).
+func putUTF16Fixed(buf []byte, s string) {
+	for i, r := range utf16.Encode([]rune(s)) {
+		if i*2+2 > len(buf) {
+			return
+		}
+		binary.LittleEndian.PutUint16(buf[i*2:], r)
 	}
 }
 
@@ -160,15 +192,19 @@ func (o *RDPExtendedInfo) Serialize() []byte {
 	core.WriteBytes(o.ClientTimeZone, buff)
 	core.WriteUInt32LE(o.ClientSessionId, buff)
 	core.WriteUInt32LE(o.PerformanceFlags, buff)
-
+	// cbAutoReconnectCookie (2 bytes) is a MANDATORY part of the Extended Info
+	// Packet (MS-RDPBCGR 2.2.1.11.1.1.1) — it must be present even when zero.
+	// Omitting it truncates the packet and the server rejects the Client Info
+	// PDU with ERRINFO_SECURITY_DATA_TOO_SHORT (0x0000111B …).
 	if o.AutoReconnect != nil {
 		core.WriteUInt16LE(o.AutoReconnect.CbAutoReconnectLen, buff)
 		core.WriteUInt32LE(o.AutoReconnect.CbLen, buff)
 		core.WriteUInt32LE(o.AutoReconnect.Version, buff)
 		core.WriteUInt32LE(o.AutoReconnect.LogonId, buff)
 		core.WriteBytes(o.AutoReconnect.SecVerifier, buff)
+	} else {
+		core.WriteUInt16LE(0, buff) // cbAutoReconnectCookie = 0
 	}
-
 	return buff.Bytes()
 }
 
@@ -190,9 +226,19 @@ type RDPInfo struct {
 
 func NewRDPInfo() *RDPInfo {
 	info := &RDPInfo{
+		// Flags mirror FreeRDP's default client info packet. Notably:
+		// - LOGONNOTIFY|LOGONERRORS: request session logon notifications; without
+		//   them Windows may leave the session stuck on the logon UI.
+		// - NOAUDIOPLAYBACK: we never play server audio via the legacy path.
+		// - AUTOLOGON is intentionally NOT set: FreeRDP does not set it either,
+		//   and on Windows Server 2022 it makes the logon path fail with
+		//   SEC_E_INTERNAL_ERROR (0x80090304) — the session lands on the logon
+		//   UI with "an error (0x80090304) in the protocol". Credentials in the
+		//   Client Info PDU are honoured regardless of this flag.
 		Flag: INFO_MOUSE | INFO_UNICODE | INFO_MAXIMIZESHELL |
 			INFO_ENABLEWINDOWSKEY | INFO_DISABLECTRLALTDEL | INFO_MOUSE_HAS_WHEEL |
-			INFO_FORCE_ENCRYPTED_CS_PDU | INFO_AUTOLOGON,
+			INFO_FORCE_ENCRYPTED_CS_PDU | INFO_LOGONNOTIFY | INFO_LOGONERRORS |
+			INFO_NOAUDIOPLAYBACK,
 		Domain:         []byte{0, 0},
 		UserName:       []byte{0, 0},
 		Password:       []byte{0, 0},
@@ -213,13 +259,26 @@ func (o *RDPInfo) SetClientInfo() {
 
 func (o *RDPInfo) Serialize(hasExtended bool) []byte {
 	buff := &bytes.Buffer{}
-	core.WriteUInt32LE(o.CodePage, buff)                      // 0000000
-	core.WriteUInt32LE(o.Flag, buff)                          // 0530101
-	core.WriteUInt16LE(uint16(len(o.Domain)-2), buff)         // 001c
-	core.WriteUInt16LE(uint16(len(o.UserName)-2), buff)       // 0008
-	core.WriteUInt16LE(uint16(len(o.Password)-2), buff)       //000c
-	core.WriteUInt16LE(uint16(len(o.AlternateShell)-2), buff) //0000
-	core.WriteUInt16LE(uint16(len(o.WorkingDir)-2), buff)     //0000
+	core.WriteUInt32LE(o.CodePage, buff)
+	core.WriteUInt32LE(o.Flag, buff)
+	// MS-RDPBCGR 2.2.1.11.1.1: cbDomain/cbUserName/cbPassword/cbAlternateShell/
+	// cbWorkingDir are the byte counts of the character data EXCLUDING the
+	// mandatory UTF-16 null terminator (FreeRDP info.c: "This size excludes (!)
+	// the length of the mandatory null terminator"). The string setters append
+	// one NUL, hence len(x)-2. NOTE: even when cb=0 the null terminator itself
+	// is still present on the wire (the reader consumes it unconditionally), so
+	// every field — empty or not — contributes its 2-byte NUL below.
+	cbOf := func(field []byte) uint16 {
+		if len(field) <= 2 {
+			return 0 // cb excludes the terminator
+		}
+		return uint16(len(field) - 2)
+	}
+	core.WriteUInt16LE(cbOf(o.Domain), buff)
+	core.WriteUInt16LE(cbOf(o.UserName), buff)
+	core.WriteUInt16LE(cbOf(o.Password), buff)
+	core.WriteUInt16LE(cbOf(o.AlternateShell), buff)
+	core.WriteUInt16LE(cbOf(o.WorkingDir), buff)
 	core.WriteBytes(o.Domain, buff)
 	core.WriteBytes(o.UserName, buff)
 	core.WriteBytes(o.Password, buff)
@@ -730,7 +789,20 @@ func (c *Client) recvLicenceInfo(channel string, s []byte) {
 	r := bytes.NewReader(s)
 	h := readSecurityHeader(r)
 	if (h.securityFlag & LICENSE_PKT) == 0 {
-		c.Emit("error", errors.New("NODE_RDP_PROTOCOL_PDU_SEC_BAD_LICENSE_HEADER"))
+		// Not a license packet. After a successful Client-Info autologon Windows
+		// skips the license exchange entirely and starts capability negotiation
+		// (Demand Active PDUs) right away (FreeRDP behaves the same). Forward
+		// this packet to the regular data path and complete the connect
+		// handshake instead of erroring out.
+		slog.Debug("sec: server skipped license phase — continuing with negotiation")
+		c.transport.On("sec", c.recvData)
+		// Emit connect FIRST: that is when the PDU layer registers its
+		// Once("data", recvDemandActivePDU) listener. The packet in hand is
+		// usually the Demand Active PDU itself, so it must be forwarded after
+		// the listener is in place or it would be dropped (server times out →
+		// EOF).
+		c.Emit("connect", c.clientData[0].(*gcc.ClientCoreData), c.userId, c.channelId)
+		c.recvData(channel, s)
 		return
 	}
 
