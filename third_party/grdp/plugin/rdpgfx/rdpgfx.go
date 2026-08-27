@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nakagami/grdp/plugin"
+	"github.com/nakagami/grdp/protocol/pdu"
 )
 
 // regionPool reuses byte slices for progressive codec rectangle extraction,
@@ -1562,6 +1563,13 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 	case codecPlanar:
 		decoded = decodePlanar(bmpData, w, h, pixFmt)
 		owned = true
+	case 0x0008:
+		// ClearCodec (MS-RDPECLEARCODEC): composition payload of residual /
+		// bands / subcodecs (RAW + NSCodec + RLEX). Fixes Windows 8.1+ which
+		// prefers ClearCodec for UI surfaces — without decoding it the client
+		// black-screens and the server drops the session.
+		decoded = g.clearCtx.decode(bmpData, w, h)
+		owned = true
 	case codecProgressive:
 		// progressive decoding garbles xrdp-encoded streams — but GDS may also send
 		// progressive and decode fine, so codec type alone is not a verdict; the
@@ -1667,6 +1675,12 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 			owned = ownedAVC
 		}
 	default:
+		if p := os.Getenv("RDPGFX_DUMP_CLEAR"); p != "" && codecId == 0x0008 {
+			dumpN.Store(dumpN.Load() + 1)
+			if dumpN.Load() <= 5 {
+				os.WriteFile(fmt.Sprintf("%s/clear-wts1-%d.bin", p, dumpN.Load()), bmpData, 0644)
+			}
+		}
 		slog.Warn("RDPGFX: unsupported codec in WTS1", "codecId", codecId, "surfId", surfId, "w", w, "h", h, "bmpLen", bmpLen)
 		return
 	}
@@ -2400,16 +2414,19 @@ func decodePlanarPlane(data []byte, offset, w, h int) ([]byte, int) {
 // --- Codec: ClearCodec (MS-RDPEGFX 2.2.4) ---
 
 func (ctx *clearCodecCtx) decode(data []byte, w, h int) []byte {
-	if len(data) < 12 {
-		return make([]byte, w*h*4)
+	out := make([]byte, w*h*4)
+	// WTS1 bitmapData layout: glyphFlags(1) + seqNumber(1), then the ClearCodec
+	// composition payload (residual/bands/subcodec counts + data). Skip the
+	// 2-byte prefix; glyph segments are not used by current servers.
+	if len(data) < 14 {
+		return out
 	}
 	// Direct binary indexing — avoids bytes.NewReader and per-field interface dispatch.
-	residualLen := int(binary.LittleEndian.Uint32(data[0:]))
-	bandsLen := int(binary.LittleEndian.Uint32(data[4:]))
-	subcodecLen := int(binary.LittleEndian.Uint32(data[8:]))
-	off := 12
+	residualLen := int(binary.LittleEndian.Uint32(data[2:]))
+	bandsLen := int(binary.LittleEndian.Uint32(data[6:]))
+	subcodecLen := int(binary.LittleEndian.Uint32(data[10:]))
+	off := 14
 
-	out := make([]byte, w*h*4)
 	if residualLen > 0 && off+residualLen <= len(data) {
 		decodeResidual(data[off:off+residualLen], w, h, out)
 	}
@@ -2424,24 +2441,45 @@ func (ctx *clearCodecCtx) decode(data []byte, w, h int) []byte {
 	return out
 }
 
+// decodeResidual decodes a ClearCodec residual segment: a run-length stream of
+// BGR colors (MS-RDPECLEARCODEC 2.2.1 / FreeRDP clear_decompress_residual_data).
+// Each record: B G R + runLengthFactor (extended to u16 then u32 when 0xFF/0xFFFF).
 func decodeResidual(data []byte, w, h int, out []byte) {
-	for y := range h {
-		rowDstStart := y * w * 4
-		rowSrcStart := y * w * 3
-		rowDstEnd := rowDstStart + w*4
-		rowSrcEnd := rowSrcStart + w*3
-		if rowDstEnd > len(out) || rowSrcEnd > len(data) {
+	off := 0
+	pixelCount := w * h
+	pixelIdx := 0
+	for off+4 <= len(data) && pixelIdx < pixelCount {
+		b := data[off]
+		g := data[off+1]
+		r := data[off+2]
+		run := uint32(data[off+3])
+		off += 4
+		if run >= 0xFF {
+			if off+2 > len(data) {
+				return
+			}
+			run = uint32(binary.LittleEndian.Uint16(data[off:]))
+			off += 2
+			if run >= 0xFFFF {
+				if off+4 > len(data) {
+					return
+				}
+				run = binary.LittleEndian.Uint32(data[off:])
+				off += 4
+			}
+		}
+		if run > uint32(pixelCount-pixelIdx) {
 			return
 		}
-		dst := out[rowDstStart:rowDstEnd:rowDstEnd]
-		src := data[rowSrcStart:rowSrcEnd:rowSrcEnd]
-		for x := range w {
-			si := x * 3
-			di := x * 4
-			dst[di] = src[si]
-			dst[di+1] = src[si+1]
-			dst[di+2] = src[si+2]
-			dst[di+3] = 0xFF
+		for i := 0; i < int(run); i++ {
+			pos := pixelIdx * 4
+			if pos+4 <= len(out) {
+				out[pos] = b
+				out[pos+1] = g
+				out[pos+2] = r
+				out[pos+3] = 0xFF
+			}
+			pixelIdx++
 		}
 	}
 }
@@ -2607,7 +2645,129 @@ func decodeSubcodec(data []byte, surfW int, out []byte) {
 					dst[di+3] = 0xFF
 				}
 			}
+		} else if subcodecId == 1 {
+			// NSCodec (MS-RDPNSC): reuse the legacy-bitmap NSCodec decoder (BGRA out)
+			px := pdu.DecodeNSCodec(bmpData, int(width), int(height))
+			if px != nil {
+				blitBGRA(px, int(width), int(height), int(xStart), int(yStart), surfW, out)
+			}
+		} else if subcodecId == 2 {
+			// RLEX (MS-RDPECLEARCODEC subcodec 2): palette + run-length suites
+			decodeRlex(bmpData, int(width), int(height), int(xStart), int(yStart), surfW, out)
 		}
-		// Skip NSCodec (1) and glyph (2) subcodecs
+	}
+}
+
+// clearLog2Floor[n] = floor(log2(n)) for n in [0,255] (FreeRDP CLEAR_LOG2_FLOOR).
+var clearLog2Floor = func() [256]uint8 {
+	var t [256]uint8
+	for i := 2; i < 256; i++ {
+		t[i] = t[i>>1] + 1
+	}
+	return t
+}()
+
+// clear8BitMasks matches FreeRDP CLEAR_8BIT_MASKS[9].
+var clear8BitMasks = [9]uint8{0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF}
+
+// blitBGRA copies a BGRA buffer into out at (xStart,yStart). 
+func blitBGRA(src []byte, w, h, xStart, yStart, surfW int, out []byte) {
+	rowDst := surfW * 4
+	for y := 0; y < h; y++ {
+		dy := yStart + y
+		srcStart := y * w * 4
+		dstStart := dy*rowDst + xStart*4
+		if srcStart < 0 || srcStart+w*4 > len(src) || dstStart < 0 || dstStart+w*4 > len(out) {
+			continue
+		}
+		copy(out[dstStart:dstStart+w*4], src[srcStart:srcStart+w*4])
+	}
+}
+
+// decodeRlex decodes an RLEX subcodec: paletteCount BGR entries, then 2-byte
+// records (tmp, runLengthFactor) encoding a run of palette[startIndex] followed
+// by a suite of (suiteDepth+1) incrementing palette entries (FreeRDP
+// clear_decompress_subcode_rlex).
+func decodeRlex(data []byte, w, h, xStart, yStart, surfW int, out []byte) {
+	if len(data) < 1 {
+		return
+	}
+	paletteCount := int(data[0])
+	if paletteCount < 1 || paletteCount > 127 {
+		return
+	}
+	if len(data) < 1+3*paletteCount {
+		return
+	}
+	palette := make([][3]byte, paletteCount)
+	off := 1
+	for i := 0; i < paletteCount; i++ {
+		b := data[off]
+		g := data[off+1]
+		r := data[off+2]
+		off += 3
+		palette[i] = [3]byte{b, g, r}
+	}
+	numBits := int(clearLog2Floor[paletteCount-1]) + 1
+	pixelCount := w * h
+	pixelIdx := 0
+	x, y := 0, 0
+	rowDst := surfW * 4
+	// writePixel writes palette[index] at current (x,y), advancing.
+	writePixel := func(index int) {
+		if pixelIdx < pixelCount && x >= 0 && x < w && y >= 0 && y < h {
+			dx := xStart + x
+			dy := yStart + y
+			pos := dy*rowDst + dx*4
+			if dx >= 0 && dy >= 0 && pos >= 0 && pos+4 <= len(out) {
+				out[pos] = palette[index][0]
+				out[pos+1] = palette[index][1]
+				out[pos+2] = palette[index][2]
+				out[pos+3] = 0xFF
+			}
+		}
+		x++
+		if x >= w {
+			x = 0
+			y++
+		}
+		pixelIdx++
+	}
+	for off+2 <= len(data) {
+		tmp := data[off]
+		run := uint32(data[off+1])
+		off += 2
+		suiteDepth := int((tmp >> numBits) & clear8BitMasks[8-numBits])
+		stopIndex := int(tmp & clear8BitMasks[numBits])
+		if run >= 0xFF {
+			if off+2 > len(data) {
+				return
+			}
+			run = uint32(binary.LittleEndian.Uint16(data[off:]))
+			off += 2
+			if run >= 0xFFFF {
+				if off+4 > len(data) {
+					return
+				}
+				run = binary.LittleEndian.Uint32(data[off:])
+				off += 4
+			}
+		}
+		startIndex := stopIndex - suiteDepth
+		if startIndex < 0 || stopIndex >= paletteCount {
+			return
+		}
+		if int(run) > pixelCount-pixelIdx {
+			return
+		}
+		for i := 0; i < int(run); i++ {
+			writePixel(startIndex)
+		}
+		if pixelIdx+suiteDepth+1 > pixelCount {
+			return
+		}
+		for i := 0; i <= suiteDepth; i++ {
+			writePixel(startIndex + i)
+		}
 	}
 }

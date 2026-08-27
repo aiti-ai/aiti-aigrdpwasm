@@ -1255,7 +1255,7 @@ func decodeSurfaceBitsCmd(r io.Reader) (*BitmapData, error) {
 	case 0: // Uncompressed
 		pixels = bitmapData
 	case 1: // NSCodec
-		pixels = decodeNSCodec(bitmapData, int(width), int(height))
+		pixels = DecodeNSCodec(bitmapData, int(width), int(height))
 		outBpp = 32 // NSCodec always decodes to BGRA (4 bytes/pixel)
 	case 3: // RemoteFX (MS-RDPRFX)
 		if DecodeRemoteFX != nil {
@@ -1303,9 +1303,9 @@ func decodeSurfaceBitsCmd(r io.Reader) (*BitmapData, error) {
 	}, nil
 }
 
-// decodeNSCodec decodes NSCodec (MS-RDPNSC) encoded bitmap data into BGRA pixels.
+// DecodeNSCodec decodes NSCodec (MS-RDPNSC) encoded bitmap data into BGRA pixels.
 // Implements the decoder exactly as FreeRDP does (libfreerdp/codec/nsc.c).
-func decodeNSCodec(data []byte, width, height int) []byte {
+func DecodeNSCodec(data []byte, width, height int) []byte {
 	if len(data) < 20 {
 		slog.Warn("NSCodec data too short", "len", len(data))
 		return nil
