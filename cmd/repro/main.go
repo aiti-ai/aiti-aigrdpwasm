@@ -24,6 +24,9 @@ func main() {
 		domain = os.Args[4]
 	}
 	c := grdp.NewRdpClient(host, 1024, 768, func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) })
+	// Mirror the page's AVC-advertisement path (the wasm build registers OnH264Raw,
+	// so CAPS_ADVERTISE declares AVC420 support — which makes Windows send ClearCodec).
+	c.OnH264Raw(func(dx, dy, w, h int, isKey bool, data []byte) { fmt.Println("H264 frame", dx, dy, w, h, "key=", isKey, "len=", len(data)) })
 	c.OnError(func(err error) { fmt.Println("onError:", err) })
 	err := c.Login(domain, user, pass)
 	if err != nil {
@@ -31,5 +34,5 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("LOGIN OK")
-	time.Sleep(3 * time.Second)
+	time.Sleep(30 * time.Second)
 }
