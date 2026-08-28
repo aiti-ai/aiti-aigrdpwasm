@@ -53,9 +53,11 @@ type rfxProgTileWork struct {
 type rfxProgressiveDecoder struct {
 	mu        sync.RWMutex
 	tileCache map[uint32]*rfxTileCoeffs // key: yIdx<<16 | xIdx
-	rectsBuf  []rfxRect
-	quantsBuf []rfxQuant
-	tilesBuf  []rfxProgTileWork
+	rectsBuf      []rfxRect
+	quantsBuf     []rfxQuant
+	progQuantsBuf []rfxProgQuant
+	tilesBuf      []rfxProgTileWork
+	contextFlags  byte // RFX_PROGRESSIVE_CONTEXT::flags (SUBBAND_DIFFING)
 }
 
 func newRfxProgressiveDecoder() *rfxProgressiveDecoder {
@@ -109,11 +111,19 @@ func (d *rfxProgressiveDecoder) Decode(data []byte, surfData []byte, width, heig
 		blockData := data[offset+6 : offset+int(blockLen)]
 
 		switch blockType {
-		case progWBTSync, progWBTFrameBegin, progWBTFrameEnd, progWBTContext:
-		// Infrastructure blocks — no action needed.
+		case progWBTSync, progWBTFrameBegin, progWBTFrameEnd:
+			// Infrastructure blocks — no action needed.
+		case progWBTContext:
+			// RFX_PROGRESSIVE_CONTEXT: ctxId(1) tileSize(2, =64) flags(1).
+			// flags bit0 = RFX_SUBBAND_DIFFING (required by upgrade passes).
+			if len(blockData) >= 4 {
+				d.mu.Lock()
+				d.contextFlags = blockData[3]
+				d.mu.Unlock()
+			}
 		case progWBTRegion:
 			// Tiles are embedded inside the region block; parseRegion decodes them.
-			regionRects, _ := d.parseRegion(blockData, surfData, width, height)
+			regionRects := d.parseRegion(blockData, surfData, width, height)
 			rects = append(rects, regionRects...)
 		default:
 			slog.Debug("RFX: unknown progressive block type", "type", blockType)
@@ -127,33 +137,36 @@ func (d *rfxProgressiveDecoder) Decode(data []byte, surfData []byte, width, heig
 
 // parseRegion extracts rects and quant tables from a PROGRESSIVE_WBT_REGION block,
 // and decodes the tile sub-blocks embedded within it onto the surface.
-// Per MS-RDPEGFX 2.2.4, tile blocks (TILE_SIMPLE/TILE_FIRST) are sub-blocks
-// inside the REGION block, not top-level stream blocks.
-func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, outH int) ([]rfxRect, []rfxQuant) {
+// Per MS-RDPEGFX 2.2.4, tile blocks (TILE_SIMPLE/TILE_FIRST/TILE_UPGRADE) are
+// sub-blocks inside the REGION block.  The REGION flags bit0 selects the
+// extrapolated subband layout (FreeRDP RFX_DWT_REDUCE_EXTRAPOLATE) — Windows
+// Server always sets it.
+func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, outH int) []rfxRect {
 	if len(data) < 12 {
-		return nil, nil
+		return nil
 	}
 
 	// tileSize := data[0]
-	numRects := binary.LittleEndian.Uint16(data[1:])
-	numQuant := data[3]
-	numProgQuant := data[4]
-	// flags := data[5]
-	numTiles := binary.LittleEndian.Uint16(data[6:])
-	// tileDataSize := binary.LittleEndian.Uint32(data[8:])
+	numRects := int(binary.LittleEndian.Uint16(data[1:]))
+	numQuant := int(data[3])
+	numProgQuant := int(data[4])
+	regionFlags := data[5]
+	numTiles := int(binary.LittleEndian.Uint16(data[6:]))
+	tileDataSize := int(binary.LittleEndian.Uint32(data[8:]))
+	extrapolate := regionFlags&progFlagDWTReduceExtrap != 0
 
 	offset := 12
 
 	// Parse rects (8 bytes each: x, y, width, height as uint16)
-	if cap(d.rectsBuf) >= int(numRects) {
+	if cap(d.rectsBuf) >= numRects {
 		d.rectsBuf = d.rectsBuf[:numRects]
 	} else {
 		d.rectsBuf = make([]rfxRect, numRects)
 	}
 	rects := d.rectsBuf
-	for i := range numRects {
+	for i := 0; i < numRects; i++ {
 		if offset+8 > len(data) {
-			return nil, nil
+			return nil
 		}
 		rx := int(binary.LittleEndian.Uint16(data[offset:]))
 		ry := int(binary.LittleEndian.Uint16(data[offset+2:]))
@@ -164,57 +177,81 @@ func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, 
 	}
 
 	// Parse quant values (5 bytes each)
-	if cap(d.quantsBuf) >= int(numQuant) {
+	if cap(d.quantsBuf) >= numQuant {
 		d.quantsBuf = d.quantsBuf[:numQuant]
 	} else {
 		d.quantsBuf = make([]rfxQuant, numQuant)
 	}
 	quants := d.quantsBuf
-	for i := range numQuant {
+	for i := 0; i < numQuant; i++ {
 		if offset+5 > len(data) {
-			return nil, nil
+			return nil
 		}
 		quants[i] = parseRfxQuant(data[offset:])
 		offset += 5
 	}
 
-	// Skip progressive quant values (RFX_PROGRESSIVE_CODEC_QUANT, 16 bytes each)
-	offset += int(numProgQuant) * 16
+	// Parse progressive quant values (RFX_PROGRESSIVE_CODEC_QUANT, 16 bytes each)
+	if cap(d.progQuantsBuf) >= numProgQuant {
+		d.progQuantsBuf = d.progQuantsBuf[:numProgQuant]
+	} else {
+		d.progQuantsBuf = make([]rfxProgQuant, numProgQuant)
+	}
+	progQuants := d.progQuantsBuf
+	for i := 0; i < numProgQuant; i++ {
+		if offset+16 > len(data) {
+			return nil
+		}
+		progQuants[i] = decodeProgQuant(data[offset:])
+		offset += 16
+	}
+
+	d.mu.RLock()
+	contextFlags := d.contextFlags
+	d.mu.RUnlock()
+	_ = contextFlags // used by TILE_UPGRADE passes (not yet implemented)
 
 	// Collect all decodable tiles before dispatching, so we can parallelise
 	// when there are enough to amortise goroutine overhead (same threshold as
 	// non-progressive decodeTileset in rfx.go).
-	if cap(d.tilesBuf) >= int(numTiles) {
+	if cap(d.tilesBuf) >= numTiles {
 		d.tilesBuf = d.tilesBuf[:0]
 	} else {
 		d.tilesBuf = make([]rfxProgTileWork, 0, numTiles)
 	}
 	tiles := d.tilesBuf
-	for offset+6 <= len(data) {
+	tileEnd := offset + tileDataSize
+	if tileEnd > len(data) {
+		tileEnd = len(data)
+	}
+	for offset+6 <= tileEnd {
 		tileType := binary.LittleEndian.Uint16(data[offset:])
-		tileLen := binary.LittleEndian.Uint32(data[offset+2:])
-		if tileLen < 6 || offset+int(tileLen) > len(data) {
+		tileLen := int(binary.LittleEndian.Uint32(data[offset+2:]))
+		if tileLen < 6 || offset+tileLen > tileEnd {
 			break
 		}
 		switch tileType {
 		case progWBTTileSimple, progWBTTileFirst, progWBTTileUpgrade:
-			tiles = append(tiles, rfxProgTileWork{tileType: tileType, data: data[offset+6 : offset+int(tileLen)]})
+			tiles = append(tiles, rfxProgTileWork{tileType: tileType, data: data[offset+6 : offset+tileLen]})
 		default:
 			slog.Debug("RFX: unknown progressive tile type", "type", tileType)
 		}
-		offset += int(tileLen)
+		offset += tileLen
 	}
 	d.tilesBuf = tiles
 
-	const parallelTileThreshold = 12
+	const parallelTileThreshold = 1 << 20
 	decodeTile := func(tw rfxProgTileWork, parallel bool) {
 		switch tw.tileType {
 		case progWBTTileSimple:
-			d.decodeTileSimple(tw.data, quants, surfData, outW, outH, parallel)
+			d.decodeTileSimple(tw.data, quants, progQuants, surfData, outW, outH, extrapolate, parallel)
 		case progWBTTileFirst:
-			d.decodeTileFirst(tw.data, quants, surfData, outW, outH, parallel)
+			d.decodeTileFirst(tw.data, quants, progQuants, surfData, outW, outH, extrapolate, parallel)
 		case progWBTTileUpgrade:
-			d.decodeTileUpgrade(tw.data, quants, surfData, outW, outH, parallel)
+			// Upgrade passes refine an existing tile to higher quality.
+			// Not yet implemented — keeping the previous pass on screen
+			// (visually softer, but never corrupted) instead of failing.
+			slog.Debug("RFX: TILE_UPGRADE not yet implemented, keeping previous pass")
 		}
 	}
 	if len(tiles) >= parallelTileThreshold {
@@ -244,7 +281,7 @@ func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, 
 		}
 	}
 
-	return rects, quants
+	return rects
 }
 
 func parseRfxQuant(data []byte) rfxQuant {
@@ -265,217 +302,133 @@ func parseRfxQuant(data []byte) rfxQuant {
 // decodeTileSimple handles PROGRESSIVE_WBT_TILE_SIMPLE (0xCCC5).
 // When parallelComponents is true the Y, Cb, and Cr channels are decoded
 // concurrently. Use true for the serial-tile path.
-func (d *rfxProgressiveDecoder) decodeTileSimple(data []byte, quants []rfxQuant, output []byte, outW, outH int, parallelComponents bool) {
-	if len(data) < 16 {
-		return
-	}
-
-	quantIdxY := data[0]
-	quantIdxCb := data[1]
-	quantIdxCr := data[2]
-	xIdx := binary.LittleEndian.Uint16(data[3:])
-	yIdx := binary.LittleEndian.Uint16(data[5:])
-	// flags := data[7]
-	yLen := binary.LittleEndian.Uint16(data[8:])
-	cbLen := binary.LittleEndian.Uint16(data[10:])
-	crLen := binary.LittleEndian.Uint16(data[12:])
-	// tailLen := binary.LittleEndian.Uint16(data[14:])
-
-	off := 16
-	yData := safeSlice(data, off, int(yLen))
-	off += int(yLen)
-	cbData := safeSlice(data, off, int(cbLen))
-	off += int(cbLen)
-	crData := safeSlice(data, off, int(crLen))
-
-	qY := rfxGetQuant(quants, int(quantIdxY))
-	qCb := rfxGetQuant(quants, int(quantIdxCb))
-	qCr := rfxGetQuant(quants, int(quantIdxCr))
-
-	var yPixels, cbPixels, crPixels []int16
-	var newY, newCb, newCr *coeffArr
-	if parallelComponents {
-		var wg sync.WaitGroup
-		wg.Go(func() { yPixels, newY = rfxDecodeComponentProgressive(yData, qY, nil) })
-		wg.Go(func() { cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, nil) })
-		wg.Go(func() { crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, nil) })
-		wg.Wait()
-	} else {
-		yPixels, newY = rfxDecodeComponentProgressive(yData, qY, nil)
-		cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, nil)
-		crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, nil)
-	}
-
-	rfxPlaceTile(yPixels, cbPixels, crPixels, int(xIdx), int(yIdx), output, outW, outH)
-
-	tileKey := uint32(yIdx)<<16 | uint32(xIdx)
-	d.mu.Lock()
-	old := d.tileCache[tileKey]
-	d.tileCache[tileKey] = &rfxTileCoeffs{y: newY, cb: newCb, cr: newCr}
-	d.mu.Unlock()
-	if old != nil {
-		if old.y != nil {
-			coeffPool.Put(old.y)
-		}
-		if old.cb != nil {
-			coeffPool.Put(old.cb)
-		}
-		if old.cr != nil {
-			coeffPool.Put(old.cr)
-		}
-	}
-
-	coeffPool.Put((*coeffArr)(yPixels))
-	coeffPool.Put((*coeffArr)(cbPixels))
-	coeffPool.Put((*coeffArr)(crPixels))
+// progTileHeader 拆出 tile 头。SIMPLE 头 16 字节（无 quality 字节，
+// quality 视为 0xFF）；FIRST/UPGRADE 头 17 字节（含 quality）。
+type progTileHeader struct {
+	quantIdxY, quantIdxCb, quantIdxCr byte
+	xIdx, yIdx                        int
+	flags                             byte
+	quality                           byte
+	yLen, cbLen, crLen, tailLen       int
+	dataOff                           int
 }
-// When parallelComponents is true the Y, Cb, and Cr channels are decoded
-// concurrently. Use true for the serial-tile path.
-func (d *rfxProgressiveDecoder) decodeTileFirst(data []byte, quants []rfxQuant, output []byte, outW, outH int, parallelComponents bool) {
+
+func parseTileHeader(data []byte, simple bool) (progTileHeader, bool) {
+	var h progTileHeader
+	if simple {
+		if len(data) < 16 {
+			return h, false
+		}
+		h.quantIdxY, h.quantIdxCb, h.quantIdxCr = data[0], data[1], data[2]
+		h.xIdx = int(binary.LittleEndian.Uint16(data[3:]))
+		h.yIdx = int(binary.LittleEndian.Uint16(data[5:]))
+		h.flags = data[7]
+		h.quality = progQualityFull
+		h.yLen = int(binary.LittleEndian.Uint16(data[8:]))
+		h.cbLen = int(binary.LittleEndian.Uint16(data[10:]))
+		h.crLen = int(binary.LittleEndian.Uint16(data[12:]))
+		h.tailLen = int(binary.LittleEndian.Uint16(data[14:]))
+		h.dataOff = 16
+		return h, true
+	}
 	if len(data) < 17 {
-		return
+		return h, false
 	}
-
-	quantIdxY := data[0]
-	quantIdxCb := data[1]
-	quantIdxCr := data[2]
-	xIdx := binary.LittleEndian.Uint16(data[3:])
-	yIdx := binary.LittleEndian.Uint16(data[5:])
-	// flags := data[7]
-	// quality := data[8]
-	yLen := binary.LittleEndian.Uint16(data[9:])
-	cbLen := binary.LittleEndian.Uint16(data[11:])
-	crLen := binary.LittleEndian.Uint16(data[13:])
-	// tailLen := binary.LittleEndian.Uint16(data[15:])
-
-	off := 17
-	yData := safeSlice(data, off, int(yLen))
-	off += int(yLen)
-	cbData := safeSlice(data, off, int(cbLen))
-	off += int(cbLen)
-	crData := safeSlice(data, off, int(crLen))
-
-	qY := rfxGetQuant(quants, int(quantIdxY))
-	qCb := rfxGetQuant(quants, int(quantIdxCb))
-	qCr := rfxGetQuant(quants, int(quantIdxCr))
-
-	var yPixels, cbPixels, crPixels []int16
-	var newY, newCb, newCr *coeffArr
-	if parallelComponents {
-		var wg sync.WaitGroup
-		wg.Go(func() { yPixels, newY = rfxDecodeComponentProgressive(yData, qY, nil) })
-		wg.Go(func() { cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, nil) })
-		wg.Go(func() { crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, nil) })
-		wg.Wait()
-	} else {
-		yPixels, newY = rfxDecodeComponentProgressive(yData, qY, nil)
-		cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, nil)
-		crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, nil)
-	}
-
-	rfxPlaceTile(yPixels, cbPixels, crPixels, int(xIdx), int(yIdx), output, outW, outH)
-
-	tileKey := uint32(yIdx)<<16 | uint32(xIdx)
-	d.mu.Lock()
-	old := d.tileCache[tileKey]
-	d.tileCache[tileKey] = &rfxTileCoeffs{y: newY, cb: newCb, cr: newCr}
-	d.mu.Unlock()
-	if old != nil {
-		if old.y != nil {
-			coeffPool.Put(old.y)
-		}
-		if old.cb != nil {
-			coeffPool.Put(old.cb)
-		}
-		if old.cr != nil {
-			coeffPool.Put(old.cr)
-		}
-	}
-
-	coeffPool.Put((*coeffArr)(yPixels))
-	coeffPool.Put((*coeffArr)(cbPixels))
-	coeffPool.Put((*coeffArr)(crPixels))
+	h.quantIdxY, h.quantIdxCb, h.quantIdxCr = data[0], data[1], data[2]
+	h.xIdx = int(binary.LittleEndian.Uint16(data[3:]))
+	h.yIdx = int(binary.LittleEndian.Uint16(data[5:]))
+	h.flags = data[7]
+	h.quality = data[8]
+	h.yLen = int(binary.LittleEndian.Uint16(data[9:]))
+	h.cbLen = int(binary.LittleEndian.Uint16(data[11:]))
+	h.crLen = int(binary.LittleEndian.Uint16(data[13:]))
+	h.tailLen = int(binary.LittleEndian.Uint16(data[15:]))
+	h.dataOff = 17
+	return h, true
 }
-// The upgrade data contains RLGR-encoded delta coefficients that are added to
-// the raw coefficients cached from the preceding TILE_FIRST (or TILE_SIMPLE)
-// pass.  If no cached state exists for the tile (e.g. the session started
-// mid-stream), the delta is decoded as if it were a standalone tile so that
-// at least some image is rendered rather than nothing.
-func (d *rfxProgressiveDecoder) decodeTileUpgrade(data []byte, quants []rfxQuant, output []byte, outW, outH int, parallelComponents bool) {
-	if len(data) < 17 {
+
+// resolveProgQuant: quality=0xFF → 全零 prog quant（FreeRDP quantProgValFull）；
+// 否则索引 region 的 progQuants。
+func resolveProgQuant(quality byte, progQuants []rfxProgQuant) (rfxProgQuant, bool) {
+	if quality == progQualityFull {
+		return rfxProgQuant{}, true
+	}
+	if int(quality) >= len(progQuants) {
+		return rfxProgQuant{}, false
+	}
+	return progQuants[quality], true
+}
+
+// decodeTileSimple / decodeTileFirst 共用：解码一个 tile 并画到 surface。
+func (d *rfxProgressiveDecoder) decodeTilePass(data []byte, quants []rfxQuant, progQuants []rfxProgQuant,
+	output []byte, outW, outH int, extrapolate bool, simple bool, parallelComponents bool) {
+
+	h, ok := parseTileHeader(data, simple)
+	if !ok {
+		return
+	}
+	prog, ok := resolveProgQuant(h.quality, progQuants)
+	if !ok {
+		slog.Debug("RFX: tile quality out of range", "quality", h.quality, "numProgQuant", len(progQuants))
 		return
 	}
 
-	quantIdxY := data[0]
-	quantIdxCb := data[1]
-	quantIdxCr := data[2]
-	xIdx := binary.LittleEndian.Uint16(data[3:])
-	yIdx := binary.LittleEndian.Uint16(data[5:])
-	// flags := data[7]
-	// quality := data[8]
-	yLen := binary.LittleEndian.Uint16(data[9:])
-	cbLen := binary.LittleEndian.Uint16(data[11:])
-	crLen := binary.LittleEndian.Uint16(data[13:])
-	// tailLen := binary.LittleEndian.Uint16(data[15:])
+	dataOff := h.dataOff
+	yData := safeSlice(data, dataOff, h.yLen)
+	dataOff += h.yLen
+	cbData := safeSlice(data, dataOff, h.cbLen)
+	dataOff += h.cbLen
+	crData := safeSlice(data, dataOff, h.crLen)
 
-	off := 17
-	yData := safeSlice(data, off, int(yLen))
-	off += int(yLen)
-	cbData := safeSlice(data, off, int(cbLen))
-	off += int(cbLen)
-	crData := safeSlice(data, off, int(crLen))
+	qY := rfxGetQuant(quants, int(h.quantIdxY))
+	qCb := rfxGetQuant(quants, int(h.quantIdxCb))
+	qCr := rfxGetQuant(quants, int(h.quantIdxCr))
 
-	qY := rfxGetQuant(quants, int(quantIdxY))
-	qCb := rfxGetQuant(quants, int(quantIdxCb))
-	qCr := rfxGetQuant(quants, int(quantIdxCr))
+	shiftY := progShift(qY, prog.y)
+	shiftCb := progShift(qCb, prog.cb)
+	shiftCr := progShift(qCr, prog.cr)
 
-	tileKey := uint32(yIdx)<<16 | uint32(xIdx)
-	d.mu.RLock()
-	cached := d.tileCache[tileKey]
-	d.mu.RUnlock()
+	tileKey := uint32(h.yIdx)<<16 | uint32(h.xIdx)
 
-	var prevY, prevCb, prevCr *coeffArr
-	if cached != nil {
-		prevY, prevCb, prevCr = cached.y, cached.cb, cached.cr
-	}
-
-	var yPixels, cbPixels, crPixels []int16
-	var newY, newCb, newCr *coeffArr
-	if parallelComponents {
-		var wg sync.WaitGroup
-		wg.Go(func() { yPixels, newY = rfxDecodeComponentProgressive(yData, qY, prevY) })
-		wg.Go(func() { cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, prevCb) })
-		wg.Go(func() { crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, prevCr) })
-		wg.Wait()
-	} else {
-		yPixels, newY = rfxDecodeComponentProgressive(yData, qY, prevY)
-		cbPixels, newCb = rfxDecodeComponentProgressive(cbData, qCb, prevCb)
-		crPixels, newCr = rfxDecodeComponentProgressive(crData, qCr, prevCr)
-	}
-
-	rfxPlaceTile(yPixels, cbPixels, crPixels, int(xIdx), int(yIdx), output, outW, outH)
-
+	// 取/建该 tile 的 `current`（跨 pass 累积的去量化系数，FreeRDP current 语义）
 	d.mu.Lock()
-	d.tileCache[tileKey] = &rfxTileCoeffs{y: newY, cb: newCb, cr: newCr}
+	cur := d.tileCache[tileKey]
+	if cur == nil {
+		cur = &rfxTileCoeffs{y: coeffPool.Get().(*coeffArr), cb: coeffPool.Get().(*coeffArr), cr: coeffPool.Get().(*coeffArr)}
+		d.tileCache[tileKey] = cur
+	}
 	d.mu.Unlock()
 
-	// Return the old cached coefficient arrays to the pool now that they are
-	// no longer referenced (the new entry has been stored above).
-	if cached != nil {
-		if cached.y != nil {
-			coeffPool.Put(cached.y)
-		}
-		if cached.cb != nil {
-			coeffPool.Put(cached.cb)
-		}
-		if cached.cr != nil {
-			coeffPool.Put(cached.cr)
-		}
+	coeffDiff := h.flags&progFlagTileDifference != 0
+
+	var yBuf, cbBuf, crBuf []int16
+	if parallelComponents {
+		var wg sync.WaitGroup
+		wg.Go(func() { yBuf = progDecodeComponent(yData, shiftY, cur.y, coeffDiff, extrapolate) })
+		wg.Go(func() { cbBuf = progDecodeComponent(cbData, shiftCb, cur.cb, coeffDiff, extrapolate) })
+		wg.Go(func() { crBuf = progDecodeComponent(crData, shiftCr, cur.cr, coeffDiff, extrapolate) })
+		wg.Wait()
+	} else {
+		yBuf = progDecodeComponent(yData, shiftY, cur.y, coeffDiff, extrapolate)
+		cbBuf = progDecodeComponent(cbData, shiftCb, cur.cb, coeffDiff, extrapolate)
+		crBuf = progDecodeComponent(crData, shiftCr, cur.cr, coeffDiff, extrapolate)
 	}
 
-	coeffPool.Put((*coeffArr)(yPixels))
-	coeffPool.Put((*coeffArr)(cbPixels))
-	coeffPool.Put((*coeffArr)(crPixels))
+	rfxPlaceTile(yBuf, cbBuf, crBuf, h.xIdx, h.yIdx, output, outW, outH)
+
+	coeffPool.Put((*coeffArr)(yBuf))
+	coeffPool.Put((*coeffArr)(cbBuf))
+	coeffPool.Put((*coeffArr)(crBuf))
+}
+
+func (d *rfxProgressiveDecoder) decodeTileSimple(data []byte, quants []rfxQuant, progQuants []rfxProgQuant,
+	output []byte, outW, outH int, extrapolate bool, parallelComponents bool) {
+	d.decodeTilePass(data, quants, progQuants, output, outW, outH, extrapolate, true, parallelComponents)
+}
+
+func (d *rfxProgressiveDecoder) decodeTileFirst(data []byte, quants []rfxQuant, progQuants []rfxProgQuant,
+	output []byte, outW, outH int, extrapolate bool, parallelComponents bool) {
+	d.decodeTilePass(data, quants, progQuants, output, outW, outH, extrapolate, false, parallelComponents)
 }
 
 func rfxGetQuant(quants []rfxQuant, idx int) rfxQuant {

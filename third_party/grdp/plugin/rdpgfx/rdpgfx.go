@@ -1631,7 +1631,7 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// (see the ready callback in grdp.go)
 		if p := os.Getenv("RDPGFX_DUMP_PROG"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
-			if dumpN.Load() <= 3 {
+			if dumpN.Load() <= 40 {
 				os.WriteFile(fmt.Sprintf("%s/prog-wts1-%d.bin", p, dumpN.Load()), bmpData, 0644)
 			}
 		}
@@ -1958,7 +1958,7 @@ func (g *GfxHandler) onWireToSurface2Decode(data []byte, skipHeavy bool) {
 		}
 		if p := os.Getenv("RDPGFX_DUMP_PROG"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
-			if dumpN.Load() <= 3 {
+			if dumpN.Load() <= 40 {
 				os.WriteFile(fmt.Sprintf("%s/prog-%d.bin", p, dumpN.Load()), bmpData, 0644)
 			}
 		}
