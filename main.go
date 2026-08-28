@@ -276,6 +276,14 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 			time.Sleep(60 * time.Millisecond)
 		}
 		setStatusText("Connected (auto-unlock sent)")
+		// Nudge the mouse to the centre: Windows uses incremental updates —
+		// a static desktop produces no further frames. A mouse-move after
+		// logon triggers the server to send the cursor + surrounding area,
+		// kick-starting the visible desktop.
+		time.Sleep(500 * time.Millisecond)
+		if !stale() {
+			g.MouseMove(640, 400)
+		}
 	}()
 	return nil
 }
