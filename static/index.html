@@ -667,9 +667,18 @@
         if (userEl && passEl && creds.u) {
           userEl.value = creds.u;
           passEl.value = creds.p || '';
-          if (typeof doConnect === 'function') {
-            setTimeout(() => { doConnect(); }, 300);
-          }
+          // The WASM runtime injects rdpConnect asynchronously ("Ready" is set
+          // right after go.run) — wait for it, a blind 300ms timer races the
+          // multi-megabyte instantiation and throws "rdpConnect is not a
+          // function".
+          (async () => {
+            for (let i = 0; i < 150; i++) {
+              if (typeof window.rdpConnect === 'function' &&
+                  (document.getElementById('status')||{}).textContent === 'Ready') break;
+              await new Promise(r => setTimeout(r, 200));
+            }
+            if (typeof window.rdpConnect === 'function') doConnect();
+          })();
         }
       }
     } catch (_) {}
