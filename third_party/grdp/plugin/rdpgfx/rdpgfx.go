@@ -2534,16 +2534,28 @@ func (ctx *clearCodecCtx) decodeIntoBuf(data []byte, w, h int, out []byte) {
 	subcodecLen := int(binary.LittleEndian.Uint32(data[10:]))
 	off := 14
 
-	if residualLen > 0 && off+residualLen <= len(data) {
-		decodeResidual(data[off:off+residualLen], w, h, out)
+	if residualLen > 0 {
+		if off+residualLen <= len(data) {
+			decodeResidual(data[off:off+residualLen], w, h, out)
+		} else {
+			slog.Warn("CLEAR: residual section out of bounds, skipped", "residualLen", residualLen, "off", off, "len", len(data))
+		}
 	}
 	off += residualLen
-	if bandsLen > 0 && off >= 0 && off+bandsLen <= len(data) {
-		ctx.decodeBands(data[off:off+bandsLen], w, out)
+	if bandsLen > 0 {
+		if off >= 0 && off+bandsLen <= len(data) {
+			ctx.decodeBands(data[off:off+bandsLen], w, out)
+		} else {
+			slog.Warn("CLEAR: bands section out of bounds, skipped", "bandsLen", bandsLen, "off", off, "len", len(data))
+		}
 	}
 	off += bandsLen
-	if subcodecLen > 0 && off >= 0 && off+subcodecLen <= len(data) {
-		decodeSubcodec(data[off:off+subcodecLen], w, out)
+	if subcodecLen > 0 {
+		if off >= 0 && off+subcodecLen <= len(data) {
+			decodeSubcodec(data[off:off+subcodecLen], w, out)
+		} else {
+			slog.Warn("CLEAR: subcodec section out of bounds, skipped", "subcodecLen", subcodecLen, "off", off, "len", len(data))
+		}
 	}
 }
 
@@ -2594,83 +2606,195 @@ func decodeResidual(data []byte, w, h int, out []byte) {
 }
 
 func (ctx *clearCodecCtx) decodeBands(data []byte, surfW int, out []byte) {
-	// Direct slice indexing — avoids bytes.NewReader and per-field interface dispatch.
+	// Ported from FreeRDP clear.c clear_decompress_bands_data — the band
+	// vBars use SHORT_VBAR entries whose pixel count is yOff-yOn (encoded in
+	// the header bytes), and every SHORT_VBAR is composed into a full-height
+	// VBarStorage entry (background + short pixels + background).
 	off := 0
 	for off+11 <= len(data) {
-		xStart := binary.LittleEndian.Uint16(data[off:])
-		yStart := binary.LittleEndian.Uint16(data[off+2:])
-		xEnd := binary.LittleEndian.Uint16(data[off+4:])
-		yEnd := binary.LittleEndian.Uint16(data[off+6:])
+		// NOTE the wire order: xStart, xEnd, yStart, yEnd (FreeRDP
+		// clear.c clear_decompress_bands_data) — the previous code read
+		// yStart before xEnd, garbling every band.
+		xStart := int(binary.LittleEndian.Uint16(data[off:]))
+		xEnd := int(binary.LittleEndian.Uint16(data[off+2:]))
+		yStart := int(binary.LittleEndian.Uint16(data[off+4:]))
+		yEnd := int(binary.LittleEndian.Uint16(data[off+6:]))
 		blueBg := data[off+8]
 		greenBg := data[off+9]
 		redBg := data[off+10]
 		off += 11
 
-		bandHeight := int(yEnd - yStart)
-		colCount := int(xEnd - xStart)
-		if bandHeight <= 0 || colCount <= 0 {
+		vBarCount := xEnd - xStart + 1
+		vBarHeight := yEnd - yStart + 1
+		if vBarCount <= 0 || vBarHeight <= 0 {
 			continue
 		}
+		if vBarHeight > 52 {
+			slog.Warn("CLEAR: band height > 52, skipping band", "h", vBarHeight)
+			return
+		}
 
-		for col := range colCount {
+		for i := 0; i < vBarCount; i++ {
 			if off+2 > len(data) {
+				slog.Warn("CLEAR: bands truncated at vBarHeader", "col", i, "of", vBarCount, "off", off, "len", len(data))
 				return
 			}
 			vBarHeader := binary.LittleEndian.Uint16(data[off:])
 			off += 2
-			x := int(xStart) + col
+			x := xStart + i
 
-			if (vBarHeader & 0xC000) == 0xC000 {
-				// SHORT_VBAR_CACHE_HIT
+			var yOn int
+			var shortEntry *vBarEntry
+			vBarUpdate := false
+			var fullEntry *vBarEntry
+
+			switch {
+			case vBarHeader&0xC000 == 0x4000:
+				// SHORT_VBAR_CACHE_HIT: one yOn byte follows; the entry pixel
+				// count comes from the cached short entry.
 				idx := int(vBarHeader & 0x3FFF)
-				if idx < len(ctx.shortVBarStorage) {
-					entry := ctx.shortVBarStorage[idx]
-					paintColumnBg(out, surfW, x, int(yStart), bandHeight, redBg, greenBg, blueBg)
-					paintVBarPixels(out, surfW, x, int(yStart), 0, entry)
-				}
-			} else if (vBarHeader & 0xC000) == 0x4000 {
-				// SHORT_VBAR_CACHE_MISS
-				pixCount := int(vBarHeader & 0x3FFF)
-				if off >= len(data) {
+				if idx >= len(ctx.shortVBarStorage) {
+					slog.Warn("CLEAR: short vBar index out of range", "idx", idx)
 					return
 				}
-				yOn := data[off]
+				shortEntry = &ctx.shortVBarStorage[idx]
+				if off >= len(data) {
+					slog.Warn("CLEAR: bands truncated at hit yOn", "col", i)
+					return
+				}
+				yOn = int(data[off])
 				off++
-				n := pixCount * 3
-				pixels := make([]byte, n)
-				available := min(n, len(data)-off)
-				copy(pixels, data[off:off+available])
-				off += available
-				entry := vBarEntry{pixels: pixels, count: pixCount}
-				if ctx.shortVBarCursor < len(ctx.shortVBarStorage) {
-					ctx.shortVBarStorage[ctx.shortVBarCursor] = entry
+				vBarUpdate = true
+			case vBarHeader&0xC000 == 0x0000:
+				// SHORT_VBAR_CACHE_MISS: header carries yOn (low byte) and
+				// yOff (bits 8-13); pixel count = yOff - yOn.
+				yOn = int(vBarHeader & 0xFF)
+				yOff := int((vBarHeader >> 8) & 0x3F)
+				if yOff < yOn {
+					slog.Warn("CLEAR: vBarYOff < vBarYOn", "yOff", yOff, "yOn", yOn)
+					return
+				}
+				pixCount := yOff - yOn
+				if pixCount > 52 {
+					slog.Warn("CLEAR: short vBar pixel count > 52", "n", pixCount)
+					return
+				}
+				if off+pixCount*3 > len(data) {
+					slog.Warn("CLEAR: bands truncated at short vBar pixels", "col", i, "off", off, "len", len(data))
+					return
+				}
+				if ctx.shortVBarCursor >= len(ctx.shortVBarStorage) {
+					slog.Warn("CLEAR: short vBar cursor out of range")
+					return
+				}
+				shortEntry = &ctx.shortVBarStorage[ctx.shortVBarCursor]
+				shortEntry.count = pixCount
+				if cap(shortEntry.pixels) < pixCount*3 {
+					shortEntry.pixels = make([]byte, pixCount*3)
+				} else {
+					shortEntry.pixels = shortEntry.pixels[:pixCount*3]
+				}
+				for y := 0; y < pixCount; y++ {
+					shortEntry.pixels[y*3] = data[off]     // B
+					shortEntry.pixels[y*3+1] = data[off+1] // G
+					shortEntry.pixels[y*3+2] = data[off+2] // R
+					off += 3
 				}
 				ctx.shortVBarCursor = (ctx.shortVBarCursor + 1) % len(ctx.shortVBarStorage)
-				paintColumnBg(out, surfW, x, int(yStart), bandHeight, redBg, greenBg, blueBg)
-				paintVBarPixels(out, surfW, x, int(yStart), int(yOn), entry)
-			} else if (vBarHeader & 0x8000) == 0x8000 {
-				// VBAR_CACHE_HIT
+				vBarUpdate = true
+			case vBarHeader&0x8000 == 0x8000:
+				// VBAR_CACHE_HIT: full-height entry; empty slots (after a
+				// context reset) get dummy height, matching FreeRDP.
 				idx := int(vBarHeader & 0x7FFF)
-				if idx < len(ctx.vBarStorage) {
-					entry := ctx.vBarStorage[idx]
-					paintVBarPixels(out, surfW, x, int(yStart), 0, entry)
+				if idx >= len(ctx.vBarStorage) {
+					slog.Warn("CLEAR: vBar index out of range", "idx", idx)
+					return
 				}
-			} else {
-				// VBAR_CACHE_MISS
-				pixCount := int(vBarHeader & 0x7FFF)
-				n := pixCount * 3
-				pixels := make([]byte, n)
-				available := min(n, len(data)-off)
-				copy(pixels, data[off:off+available])
-				off += available
-				entry := vBarEntry{pixels: pixels, count: pixCount}
-				if ctx.vBarCursor < len(ctx.vBarStorage) {
-					ctx.vBarStorage[ctx.vBarCursor] = entry
+				fullEntry = &ctx.vBarStorage[idx]
+				if len(fullEntry.pixels) < vBarHeight*3 {
+					fullEntry.count = vBarHeight
+					fullEntry.pixels = make([]byte, vBarHeight*3)
+					for y := 0; y < vBarHeight; y++ {
+						fullEntry.pixels[y*3] = blueBg
+						fullEntry.pixels[y*3+1] = greenBg
+						fullEntry.pixels[y*3+2] = redBg
+					}
 				}
-				ctx.vBarCursor = (ctx.vBarCursor + 1) % len(ctx.vBarStorage)
-				paintVBarPixels(out, surfW, x, int(yStart), 0, entry)
+			default:
+				slog.Warn("CLEAR: invalid vBarHeader", "header", vBarHeader)
+				return
 			}
+
+			if vBarUpdate {
+				// Compose the full-height vBar into VBarStorage (FreeRDP
+				// stores composed short vBars there too): [0,yOn)=bkg,
+				// [yOn,yOn+cnt)=short pixels, [yOn+cnt,h)=bkg.
+				if ctx.vBarCursor >= len(ctx.vBarStorage) {
+					slog.Warn("CLEAR: vBar cursor out of range")
+					return
+				}
+				shortCount := 0
+				if shortEntry != nil {
+					shortCount = shortEntry.count
+				}
+				fullEntry = &ctx.vBarStorage[ctx.vBarCursor]
+				fullEntry.count = vBarHeight
+				if cap(fullEntry.pixels) < vBarHeight*3 {
+					fullEntry.pixels = make([]byte, vBarHeight*3)
+				} else {
+					fullEntry.pixels = fullEntry.pixels[:vBarHeight*3]
+				}
+				fillBkg := func(from, to int) {
+					for y := from; y < to && y < vBarHeight; y++ {
+						fullEntry.pixels[y*3] = blueBg
+						fullEntry.pixels[y*3+1] = greenBg
+						fullEntry.pixels[y*3+2] = redBg
+					}
+				}
+				fillBkg(0, yOn)
+				for y := 0; y < shortCount && yOn+y < vBarHeight; y++ {
+					fullEntry.pixels[(yOn+y)*3] = shortEntry.pixels[y*3]
+					fullEntry.pixels[(yOn+y)*3+1] = shortEntry.pixels[y*3+1]
+					fullEntry.pixels[(yOn+y)*3+2] = shortEntry.pixels[y*3+2]
+				}
+				fillBkg(yOn+shortCount, vBarHeight)
+				ctx.vBarCursor = (ctx.vBarCursor + 1) % len(ctx.vBarStorage)
+			} else if fullEntry == nil {
+				continue
+			}
+
+			if fullEntry.count != vBarHeight {
+				fullEntry.count = vBarHeight
+				if cap(fullEntry.pixels) < vBarHeight*3 {
+					fullEntry.pixels = make([]byte, vBarHeight*3)
+				} else {
+					fullEntry.pixels = fullEntry.pixels[:vBarHeight*3]
+				}
+			}
+
+			// Paint column x: rows yStart..yStart+entry.count.
+			paintColumnFromEntry(out, surfW, x, yStart, fullEntry)
 		}
+	}
+}
+
+// paintColumnFromEntry blits one vBar entry as a vertical column.
+func paintColumnFromEntry(out []byte, surfW, x, yStart int, entry *vBarEntry) {
+	if x < 0 || surfW <= 0 || x >= surfW {
+		return
+	}
+	for y := 0; y < entry.count; y++ {
+		dy := yStart + y
+		idx := (dy*surfW + x) * 4
+		si := y * 3
+		if idx < 0 || idx+4 > len(out) || si+3 > len(entry.pixels) {
+			continue
+		}
+		px := out[idx : idx+4 : idx+4]
+		px[0] = entry.pixels[si]
+		px[1] = entry.pixels[si+1]
+		px[2] = entry.pixels[si+2]
+		px[3] = 0xFF
 	}
 }
 
