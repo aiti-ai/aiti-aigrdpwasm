@@ -303,7 +303,6 @@ func renderBitmaps(bs []grdp.Bitmap) {
 		jsArr := uint8ClampedCtor.New(len(rgba))
 		js.CopyBytesToJS(jsArr, rgba)
 		imageData := imageDataCtor.New(jsArr, w, h)
-		js.Global().Get("console").Call("log", "PUTIMG", bm.DestLeft, bm.DestTop, bm.DestRight, bm.DestBottom, w, h, len(bm.Data))
 		ctx2d.Call("putImageData", imageData, bm.DestLeft, bm.DestTop)
 		}
 }

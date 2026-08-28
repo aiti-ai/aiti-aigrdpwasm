@@ -269,10 +269,8 @@
           // frames) and leaves the screen garbled. Fall back to noGfx mode
           // (legacy bitmap rendering, always works) after repeated errors.
           window.__avcErr = (window.__avcErr || 0) + 1;
-          if (window.__avcErr >= 3 && connected && !/[?&]nogfx=1/.test(location.search)) {
-            console.warn('WebCodecs H.264 failing repeatedly — reloading in noGfx (legacy bitmap) mode');
-            const sep = location.search ? location.search + '&nogfx=1' : '?nogfx=1';
-            location.href = location.pathname + sep;
+          if (window.__avcErr >= 3 && connected) {
+            reloadNoGfx('WebCodecs H.264 decoder failed ' + window.__avcErr + 'x');
           }
         }
       });
