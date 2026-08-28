@@ -643,11 +643,21 @@
         // A healthy AVC session always delivers at least the initial
         // keyframe within this window.
         if (h264Seen === 0) {
-          reloadNoGfx('AVC420 session produced no H.264 frames in 25s (server fell back to sparse ClearCodec)');
+          // With AUTOLOGON, Windows Server 2022 renders the desktop via
+          // ClearCodec (no H.264 at all). Don't downgrade just because
+          // h264Seen=0 — check whether ClearCodec actually delivered
+          // content: >1500 distinct colors means the desktop is rendering.
+          // The login process takes 30-40s (logonInfoV2 → desktop), so the
+          // window is 45s.
+          if (colors.size < 1500) {
+            reloadNoGfx('AVC420 session produced no H.264 frames and only ' + colors.size + ' colors in 45s (ClearCodec not rendering)');
+            return;
+          }
+          console.log('gfx quality watchdog: ClearCodec-only OK (' + colors.size + ' colors, no H.264 but desktop rendering)');
           return;
         }
         console.log('gfx quality watchdog: OK (' + colors.size + ' colors, h264 frames: ' + h264Seen + ')');
-      }, 25000);
+      }, 45000);
     }
 
     function rdpOnError(msg) {
