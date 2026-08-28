@@ -1972,9 +1972,11 @@ func (g *GfxHandler) onWireToSurface2Decode(data []byte, skipHeavy bool) {
 			}
 		}
 	case codecProgressive:
-		if skipHeavy {
-			break // frame drop
-		}
+		// NOTE: no skipHeavy drop.  UI content (menu/taskbar/icons) arrives as
+		// progressive frames; a dropped frame is NEVER resent by the server
+		// (it believes the client rendered it), permanently losing those
+		// regions — the "half-drawn start menu" corruption.  The server-side
+		// outstanding-frame ACK window bounds any backlog.
 		if p := os.Getenv("RDPGFX_DUMP_PROG"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
 			if dumpN.Load() <= 40 {
@@ -2522,6 +2524,7 @@ func (ctx *clearCodecCtx) decodeIntoBuf(data []byte, w, h int, out []byte) {
 	// composition payload (residual/bands/subcodec counts + data). Skip the
 	// 2-byte prefix; glyph segments are not used by current servers.
 	if len(data) < 14 {
+		slog.Warn("CLEAR: payload too short", "len", len(data))
 		return
 	}
 	// Direct binary indexing — avoids bytes.NewReader and per-field interface dispatch.
@@ -2558,12 +2561,14 @@ func decodeResidual(data []byte, w, h int, out []byte) {
 		off += 4
 		if run >= 0xFF {
 			if off+2 > len(data) {
+				slog.Warn("CLEAR: residual truncated at ext run", "off", off, "len", len(data))
 				return
 			}
 			run = uint32(binary.LittleEndian.Uint16(data[off:]))
 			off += 2
 			if run >= 0xFFFF {
 				if off+4 > len(data) {
+					slog.Warn("CLEAR: residual truncated at ext2 run", "off", off, "len", len(data))
 					return
 				}
 				run = binary.LittleEndian.Uint32(data[off:])
@@ -2571,6 +2576,7 @@ func decodeResidual(data []byte, w, h int, out []byte) {
 			}
 		}
 		if run > uint32(pixelCount-pixelIdx) {
+			slog.Warn("CLEAR: residual run overruns tile", "run", run, "remaining", pixelCount-pixelIdx, "pixelIdx", pixelIdx)
 			return
 		}
 		for i := 0; i < int(run); i++ {
@@ -2718,7 +2724,11 @@ func decodeSubcodec(data []byte, surfW int, out []byte) {
 		subcodecId := data[off+12]
 		off += 13
 		if off+bmpLen > len(data) {
+			slog.Warn("CLEAR: subcodec block truncated", "subcodecId", subcodecId, "bmpLen", bmpLen, "off", off, "len", len(data))
 			break
+		}
+		if p := os.Getenv("RDPGFX_DUMP_CLEAR"); p != "" {
+			fmt.Printf("CLEAR_SUB id=%d w=%d h=%d bmpLen=%d\n", subcodecId, width, height, bmpLen)
 		}
 		bmpData := data[off : off+bmpLen]
 		off += bmpLen
