@@ -221,6 +221,43 @@ func newClearCodecCtx() *clearCodecCtx {
 	}
 }
 
+// DecodeClearFrame decodes one standalone ClearCodec payload (fresh cache state)
+// into a w*h*4 BGRA buffer. Exported for offline debugging tools (cmd/cleartest).
+func DecodeClearFrame(payload []byte, w, h int) []byte {
+	ctx := newClearCodecCtx()
+	out := make([]byte, w*h*4)
+	ctx.decodeIntoBuf(payload, w, h, out)
+	return out
+}
+
+// DecodeProgressiveFrame decodes one standalone progressive (RFX) payload onto
+// a blank w*h*4 BGRA buffer. Exported for offline debugging (cmd/progtest).
+func DecodeProgressiveFrame(payload []byte, w, h int) []byte {
+	g := NewGfxHandler(nil)
+	out := make([]byte, w*h*4)
+	for i := 3; i < len(out); i += 4 {
+		out[i] = 0xFF
+	}
+	g.progressive.Decode(payload, out, w, h)
+	return out
+}
+
+// ClearSession is an exported handle for offline tools that need to decode a
+// SEQUENCE of frames with SHARED V-Bar cache state (mimicking a live session).
+type ClearSession struct {
+	ctx *clearCodecCtx
+}
+
+// NewClearSession creates a ClearCodec session with persistent cache state.
+func NewClearSession() *ClearSession { return &ClearSession{ctx: newClearCodecCtx()} }
+
+// Decode decodes one frame against the shared session state.
+func (s *ClearSession) Decode(payload []byte, w, h int) []byte {
+	out := make([]byte, w*h*4)
+	s.ctx.decodeIntoBuf(payload, w, h, out)
+	return out
+}
+
 type cacheEntry struct {
 	data          []byte // BGRA pixel data
 	width, height int
@@ -1579,6 +1616,12 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// bands / subcodecs (RAW + NSCodec + RLEX). Fixes Windows 8.1+ which
 		// prefers ClearCodec for UI surfaces — without decoding it the client
 		// black-screens and the server drops the session.
+		if p := os.Getenv("RDPGFX_DUMP_CLEAR"); p != "" {
+			dumpN.Store(dumpN.Load() + 1)
+			if dumpN.Load() <= 20 {
+				os.WriteFile(fmt.Sprintf("%s/clear-wts2-%02d_%dx%d.bin", p, dumpN.Load(), w, h), bmpData, 0644)
+			}
+		}
 		decoded = g.clearCtx.decodeInto(bmpData, w, h, s.data, int(s.width), int(s.height), int(left), int(top))
 		owned = true
 	case codecProgressive:

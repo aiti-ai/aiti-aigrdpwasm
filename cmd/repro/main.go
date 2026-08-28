@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"log/slog"
 	"net"
@@ -30,14 +31,33 @@ func main() {
 	c := grdp.NewRdpClient(host, 1280, 800, func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) })
 	// Mirror the page's AVC-advertisement path (the wasm build registers OnH264Raw,
 	// so CAPS_ADVERTISE declares AVC420 support — which makes Windows send ClearCodec).
+	c.DisableAVC444() // 与 wasm main.go 对齐：只广告 v8.0+v8.1（AVC420），观察 Windows 实际发送的 codec
+	if os.Getenv("REPRO_NOGFX") != "" {
+		c.DisableGFX() // legacy 位图模式（模拟页面 ?nogfx=1）
+	}
 	c.OnH264Raw(func(dx, dy, w, h int, isKey bool, data []byte) { fmt.Println("H264 frame", dx, dy, w, h, "key=", isKey, "len=", len(data)) })
 	n := 0
 	// Full-canvas compositing: paint every block onto a 1280x800 surface.
 	canvasImg := image.NewRGBA(image.Rect(0, 0, 1280, 800))
 	c.OnBitmap(func(bs []grdp.Bitmap) {
 		for _, b := range bs {
-			fmt.Printf("BMP t=%.1f L=%d T=%d R=%d B=%d W=%d H=%d dataLen=%d\n",
-				time.Since(start).Seconds(), b.DestLeft, b.DestTop, b.DestRight, b.DestBottom, b.Width, b.Height, len(b.Data))
+			fmt.Printf("BMP t=%.1f L=%d T=%d R=%d B=%d W=%d H=%d bpp=%d dataLen=%d\n",
+				time.Since(start).Seconds(), b.DestLeft, b.DestTop, b.DestRight, b.DestBottom, b.Width, b.Height, b.BitsPerPixel, len(b.Data))
+			if n <= 6 {
+				// 保存前几个原始 tile 供离线检查
+				tileImg := image.NewRGBA(image.Rect(0, 0, b.Width, b.Height))
+				for y := 0; y < b.Height; y++ {
+					for x := 0; x < b.Width; x++ {
+						i := (y*b.Width + x) * 4
+						if i+3 < len(b.Data) {
+							tileImg.SetRGBA(x, y, color.RGBA{b.Data[i+2], b.Data[i+1], b.Data[i], 0xFF})
+						}
+					}
+				}
+				tf, _ := os.Create(fmt.Sprintf("/tmp/legacy-tile-%d_%dx%d_at%d_%d.png", n, b.Width, b.Height, b.DestLeft, b.DestTop))
+				png.Encode(tf, tileImg)
+				tf.Close()
+			}
 			if b.BitsPerPixel == 4 {
 				for y := 0; y < b.Height && b.DestTop+y < 800; y++ {
 					for x := 0; x < b.Width && b.DestLeft+x < 1280; x++ {

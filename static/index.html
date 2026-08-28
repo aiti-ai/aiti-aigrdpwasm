@@ -623,18 +623,27 @@
         let d;
         try { d = ctx.getImageData(0, 0, c.width, c.height).data; } catch (_) { return; }
         const colors = new Set();
-        let greenMagenta = 0, sampled = 0;
+        let greenMagenta = 0, grey = 0, sampled = 0;
         for (let j = 0; j < d.length; j += 16) { // sample every 4th pixel
           const r = d[j], g = d[j+1], b = d[j+2];
           colors.add((r<<16)|(g<<8)|b);
           sampled++;
           // Saturated pure green / magenta = classic dual-stream YUV mismatch
           if ((g > 180 && r < 80 && b < 80) || (r > 180 && b > 180 && g < 80)) greenMagenta++;
+          // (128,128,128) = the logon-desktop placeholder grey: when progressive
+          // (RFX) frames are garbled/dropped the body never gets painted and
+          // only sparse ClearCodec incrementals cover small deltas.
+          if (r === 128 && g === 128 && b === 128) grey++;
         }
         const gmPct = sampled ? greenMagenta / sampled : 0;
         const h264Seen = window.__h264Seen || 0;
         if (gmPct > 0.25) {
           reloadNoGfx('saturated green/magenta on ' + Math.round(gmPct*100) + '% of pixels (dual-stream chroma mismatch)');
+          return;
+        }
+        const greyPct = sampled ? grey / sampled : 0;
+        if (greyPct > 0.4) {
+          reloadNoGfx('logon-placeholder grey on ' + Math.round(greyPct*100) + '% of pixels (progressive/RFX decode failure)');
           return;
         }
         // Declared AVC420 but not a single H.264 frame arrived: the server

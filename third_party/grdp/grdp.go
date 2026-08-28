@@ -673,6 +673,11 @@ func (g *RdpClient) doLogin(routingToken []byte) error {
 		g.eventReady.Store(true)
 		readyFired = true
 		send(connResult{})
+		// MS-RDPBCGR 3.1.1.10: the client SHOULD send an Input Event Sync right
+		// after activation to publish keyboard lock state. Servers with virtual
+		// input devices (gnome-remote-desktop system daemon / GDM) may drop
+		// scancodes until the first sync arrives.
+		g.pdu.SendInputEvents(pdu.INPUT_EVENT_SYNC, []pdu.InputEventsInterface{&pdu.SynchronizeEvent{}})
 		// Auto-negotiation verdict: the server enabled NSCodec capture (xrdp assigns
 		// NSCodec ID=1) -> its EGFX stream contains codecs we cannot decode ->
 		// trigger a compat reconnect immediately. GDS lists NSCodec with ID=0
