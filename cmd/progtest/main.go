@@ -10,6 +10,8 @@ import (
 	"github.com/nakagami/grdp/plugin/rdpgfx"
 )
 
+var shared = rdpgfx.NewProgSession()
+
 func main() {
 	dir := os.Args[1]
 	entries, _ := os.ReadDir(dir)
@@ -21,7 +23,7 @@ func main() {
 		if err != nil {
 			continue
 		}
-		out := rdpgfx.DecodeProgressiveFrame(data, 1280, 800)
+		out := shared.Decode(data, 1280, 800)
 		writePNG(filepath.Join(dir, strings.TrimSuffix(e.Name(), ".bin")+".png"), out, 1280, 800)
 		// 统计
 		colors := map[uint32]int{}

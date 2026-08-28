@@ -513,3 +513,21 @@ func progUpgradeComponent(shift, bitPos, numBits rfxQuant, current, sign []int16
 	}
 	return work
 }
+
+// ProgSession is an exported sequential-decode handle for offline tools.
+type ProgSession struct {
+	d *rfxProgressiveDecoder
+}
+
+// NewProgSession creates a progressive decoder with persistent state.
+func NewProgSession() *ProgSession { return &ProgSession{d: newRfxProgressiveDecoder()} }
+
+// Decode decodes one progressive frame onto the surface buffer.
+func (p *ProgSession) Decode(payload []byte, w, h int) []byte {
+	out := make([]byte, w*h*4)
+	for i := 3; i < len(out); i += 4 {
+		out[i] = 0xFF
+	}
+	p.d.progressiveDecode(payload, out, w, h)
+	return out
+}

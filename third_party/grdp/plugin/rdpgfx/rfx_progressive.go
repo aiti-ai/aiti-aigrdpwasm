@@ -117,6 +117,11 @@ type rfxRect struct {
 // Decode processes RFX Progressive codec data, rendering tiles onto the
 // provided surface buffer. Returns the bounding rectangles of decoded regions.
 func (d *rfxProgressiveDecoder) Decode(data []byte, surfData []byte, width, height int) []rfxRect {
+	return d.progressiveDecode(data, surfData, width, height)
+}
+
+// progressiveDecode is the shared implementation used by Decode.
+func (d *rfxProgressiveDecoder) progressiveDecode(data []byte, surfData []byte, width, height int) []rfxRect {
 	var rects []rfxRect
 
 	offset := 0
@@ -474,17 +479,19 @@ func subQuant(a, b rfxQuant) rfxQuant {
 func (d *rfxProgressiveDecoder) decodeTileUpgrade(data []byte, quants []rfxQuant, progQuants []rfxProgQuant,
 	output []byte, outW, outH int, extrapolate bool, parallelComponents bool) {
 
-	// 头 20 字节: quantIdxY/Cb/Cr(3) xIdx(2) yIdx(2) quality(1)
+	// 头 20 字节: quantIdxY/Cb/Cr(3) xIdx(2) yIdx(2) quality(1)  ← quality 在 byte7
 	//             ySrlLen(2) yRawLen(2) cbSrlLen(2) cbRawLen(2) crSrlLen(2) crRawLen(2)
+	// （UPGRADE 没有 flags 字节，与 FIRST/SIMPLE 的头布局不同）
 	if len(data) < 20 {
 		return
 	}
-	h, ok := parseTileHeader(data, false)
-	if !ok {
-		return
+	h := progTileHeader{
+		quantIdxY: data[0], quantIdxCb: data[1], quantIdxCr: data[2],
+		xIdx: int(binary.LittleEndian.Uint16(data[3:])),
+		yIdx: int(binary.LittleEndian.Uint16(data[5:])),
+		quality: data[7],
+		dataOff: 20,
 	}
-	// upgrade 头没有 yLen/cbLen/crLen/tailLen，而是 6 个 SRL/RAW 长度
-	h.dataOff = 20
 	ySrlLen := int(binary.LittleEndian.Uint16(data[9:]))
 	yRawLen := int(binary.LittleEndian.Uint16(data[11:]))
 	cbSrlLen := int(binary.LittleEndian.Uint16(data[13:]))

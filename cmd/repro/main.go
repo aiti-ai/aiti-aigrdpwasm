@@ -101,5 +101,25 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("LOGIN OK")
+
+	// 刺激 UI 变化以捕获 TILE_UPGRADE 帧：Ctrl+Esc 打开开始菜单，
+	// 数秒后 Esc 关闭，重复两次。
+	go func() {
+		time.Sleep(8 * time.Second)
+		for round := 0; round < 2; round++ {
+			fmt.Println("STIM: Ctrl+Esc (start menu)")
+			c.KeyDown(0x1D) // Ctrl
+			c.KeyDown(0x01) // Esc
+			time.Sleep(120 * time.Millisecond)
+			c.KeyUp(0x01)
+			c.KeyUp(0x1D)
+			time.Sleep(9 * time.Second)
+			c.KeyDown(0x01) // Esc 关闭菜单
+			time.Sleep(100 * time.Millisecond)
+			c.KeyUp(0x01)
+			time.Sleep(6 * time.Second)
+		}
+	}()
+
 	time.Sleep(55 * time.Second)
 }
