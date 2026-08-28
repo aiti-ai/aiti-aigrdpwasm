@@ -38,6 +38,13 @@ func main() {
 			continue
 		}
 		out := rdpgfx.DecodeClearFrame(data, w, h)
+		// 子块分离导出：定位 garbling 到具体子编解码
+		if ids, imgs := rdpgfx.ClearDecodeSubBlocks(data, w, h); len(ids) > 0 {
+			basename := strings.TrimSuffix(n, ".bin")
+			for i, img := range imgs {
+				writeBMP(filepath.Join(dir, fmt.Sprintf("%s-sub%02d-id%d.bmp", basename, i, ids[i])), img, w, h)
+			}
+		}
 		writeBMP(filepath.Join(dir, strings.TrimSuffix(n, ".bin")+".bmp"), out, w, h)
 		colors := map[uint32]int{}
 		for i := 0; i+3 < len(out); i += 8 {
@@ -77,6 +84,9 @@ func writeBMP(path string, px []byte, w, h int) {
 		dst := 54 + (h-1-y)*rowSize
 		for x := 0; x < w; x++ {
 			o := (y*w + x) * 4
+			if o+3 >= len(px) {
+				break
+			}
 			b[dst] = px[o]
 			b[dst+1] = px[o+1]
 			b[dst+2] = px[o+2]

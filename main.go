@@ -28,7 +28,19 @@ var (
 	swapAltMeta    bool
 )
 
+// consoleWriter routes log output to the browser console (slog in WASM has
+// no stderr; without this every Warn/Error is silently swallowed).
+type consoleWriter struct{}
+
+func (consoleWriter) Write(p []byte) (int, error) {
+	js.Global().Get("console").Call("log", "[grdp] "+string(p))
+	return len(p), nil
+}
+
 func main() {
+	if h := js.Global().Get("console"); !h.IsUndefined() {
+		slog.SetDefault(slog.New(slog.NewTextHandler(consoleWriter{}, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	}
 	js.Global().Set("rdpConnect", js.FuncOf(jsConnect))
 	js.Global().Set("rdpDisconnect", js.FuncOf(jsDisconnect))
 	js.Global().Set("rdpMouseMove", js.FuncOf(jsMouseMove))

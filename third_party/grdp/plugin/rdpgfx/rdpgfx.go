@@ -806,10 +806,11 @@ func (g *GfxHandler) noteSurfaceCodec(codecId uint16) {
 func (g *GfxHandler) CodecCounts() map[uint16]int {
 	g.codecCountsMu.Lock()
 	defer g.codecCountsMu.Unlock()
-	out := make(map[uint16]int, len(g.codecCounts))
+	out := make(map[uint16]int, len(g.codecCounts)+1)
 	for k, v := range g.codecCounts {
 		out[k] = v
 	}
+	out[0xFFFF] = int(clearSubBlockCount.Load()) // sub-block decode count
 	return out
 }
 
@@ -2712,7 +2713,67 @@ func paintVBarPixels(out []byte, surfW, x, yStart, yOn int, entry vBarEntry) {
 	}
 }
 
+// ClearDecodeSubBlocks walks one ClearCodec payload and decodes EACH
+// sub-block separately into its own w*h*4 BGRA image — offline diagnostics
+// to attribute garbling to a specific subcodec.
+func ClearDecodeSubBlocks(payload []byte, w, h int) (ids []int, outs [][]byte) {
+	if len(payload) < 14 {
+		return nil, nil
+	}
+	residualLen := int(binary.LittleEndian.Uint32(payload[2:]))
+	bandsLen := int(binary.LittleEndian.Uint32(payload[6:]))
+	subcodecLen := int(binary.LittleEndian.Uint32(payload[10:]))
+	off := 14
+	off += residualLen
+	off += bandsLen
+	if off >= len(payload) {
+		return nil, nil
+	}
+	end := off + subcodecLen
+	if end > len(payload) {
+		end = len(payload)
+	}
+	for off+13 <= end {
+		xStart := int(binary.LittleEndian.Uint16(payload[off:]))
+		yStart := int(binary.LittleEndian.Uint16(payload[off+2:]))
+		sw := int(binary.LittleEndian.Uint16(payload[off+4:]))
+		sh := int(binary.LittleEndian.Uint16(payload[off+6:]))
+		bmpLen := int(binary.LittleEndian.Uint32(payload[off+8:]))
+		sub := payload[off+12]
+		off += 13
+		if off+bmpLen > end {
+			break
+		}
+		bmp := payload[off : off+bmpLen]
+		off += bmpLen
+		out := make([]byte, sw*sh*4)
+		switch sub {
+		case 0: // RAW BGRX
+			for i := 0; i < sw*sh && (i+1)*4 <= len(bmp); i++ {
+				out[i*4] = bmp[i*4]
+				out[i*4+1] = bmp[i*4+1]
+				out[i*4+2] = bmp[i*4+2]
+				out[i*4+3] = 0xFF
+			}
+		case 1: // NSCodec
+			if px := pdu.DecodeNSCodec(bmp, sw, sh); px != nil {
+				copy(out, px)
+			}
+		case 2: // RLEX
+			decodeRlex(bmp, sw, sh, 0, 0, sw, out)
+		}
+		ids = append(ids, int(sub))
+		outs = append(outs, out)
+		_ = xStart
+		_ = yStart
+	}
+	return ids, outs
+}
+
+var clearSubBlockCount atomic.Int64
+
 func decodeSubcodec(data []byte, surfW int, out []byte) {
+	clearSubBlockCount.Add(1)
 	// Direct slice indexing — avoids bytes.NewReader and per-field interface dispatch.
 	off := 0
 	for off+13 <= len(data) {
