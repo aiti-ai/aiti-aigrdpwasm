@@ -268,6 +268,8 @@ type GfxHandler struct {
 	surfaces     map[uint16]*surface
 	cacheEntries map[uint16]cacheEntry
 	clearCtx     *clearCodecCtx
+	codecCountsMu sync.Mutex
+	codecCounts   map[uint16]int
 	zgfx         *zgfxContext
 	rfx          *rfxDecoder
 	progressive  *rfxProgressiveDecoder
@@ -792,6 +794,23 @@ func (g *GfxHandler) noteSurfaceCodec(codecId uint16) {
 	if codecId == codecAVC420 || codecId == codecAVC444 {
 		g.avcSeen.Store(true)
 	}
+	g.codecCountsMu.Lock()
+	if g.codecCounts == nil {
+		g.codecCounts = map[uint16]int{}
+	}
+	g.codecCounts[codecId]++
+	g.codecCountsMu.Unlock()
+}
+
+// CodecCounts returns a snapshot of surface-codec arrival counts (diagnostics).
+func (g *GfxHandler) CodecCounts() map[uint16]int {
+	g.codecCountsMu.Lock()
+	defer g.codecCountsMu.Unlock()
+	out := make(map[uint16]int, len(g.codecCounts))
+	for k, v := range g.codecCounts {
+		out[k] = v
+	}
+	return out
 }
 
 // SetKeyframeRequestFunc registers a function that is called after each

@@ -3,6 +3,8 @@
 package main
 
 import (
+	"sort"
+	"strings"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +38,21 @@ func main() {
 	js.Global().Set("rdpKeyDown", js.FuncOf(jsKeyDown))
 	js.Global().Set("rdpKeyUp", js.FuncOf(jsKeyUp))
 	js.Global().Set("rdpClipboardChanged", js.FuncOf(jsClipboardChanged))
+	js.Global().Set("rdpStats", js.FuncOf(func(_ js.Value, _ []js.Value) any {
+		clientMu.Lock()
+		c := rdpClient
+		clientMu.Unlock()
+		if c == nil {
+			return ""
+		}
+		counts := c.CodecCounts()
+		parts := make([]string, 0, len(counts))
+		for id, n := range counts {
+			parts = append(parts, fmt.Sprintf("%d:%d", id, n))
+		}
+		sort.Strings(parts)
+		return strings.Join(parts, ",")
+	}))
 
 	// Block forever — JS callbacks keep things alive.
 	select {}

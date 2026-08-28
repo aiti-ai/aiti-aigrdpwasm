@@ -456,10 +456,14 @@
       const custom = new URLSearchParams(location.search).get("wasm")
         || localStorage.getItem("grdpwasm.wasmUrl");
       if (custom) return [custom];
+      // Same-origin first: bridge/pi-web deployments always serve a freshly
+      // deployed main.wasm next to this page.  The CDN copies (npm package)
+      // can lag behind and silently run a stale decoder, so they are the
+      // fallback, not the primary source.
       return [
+        "main.wasm",
         `https://cdn.jsdelivr.net/npm/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
         `https://unpkg.com/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
-        "main.wasm", // same-origin fallback (local `make serve` / deployments that kept the wasm)
       ];
     }
     async function fetchPlain(url) {

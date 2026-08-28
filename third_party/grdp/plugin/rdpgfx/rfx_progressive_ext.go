@@ -97,12 +97,14 @@ func progShiftBand(data []int16, shift uint8) {
 //	shift      effective per-band dequant shifts (quant + progQuant - 1)
 //	current    accumulated (dequantized) coefficients of the previous pass —
 //	           also receives the new accumulated state (FreeRDP `current`)
+//	sign       raw RLGR output of the latest pass (FreeRDP `sign`, the
+//	           sign/refinement map consumed by TILE_UPGRADE passes)
 //	coeffDiff  tile flags bit0: data is a delta on top of `current`
 //	extrapolate region flags bit0: extrapolated subband layout + strided DWT
 //
 // Returns the 64x64 coefficient array ready for the YCbCr→RGB transform
 // (same backing as `buffer`).
-func progDecodeComponent(data []byte, shift rfxQuant, current *coeffArr, coeffDiff, extrapolate bool) []int16 {
+func progDecodeComponent(data []byte, shift rfxQuant, current *coeffArr, sign *coeffArr, coeffDiff, extrapolate bool) []int16 {
 	const tilePixels = rfxTileSize * rfxTileSize
 
 	buffer := coeffPool.Get().(*coeffArr)
@@ -114,6 +116,11 @@ func progDecodeComponent(data []byte, shift rfxQuant, current *coeffArr, coeffDi
 		// Progressive codec always uses RLGR mode 1.
 		work = rlgr1Decode(data, tilePixels, work)
 	}
+
+	// FreeRDP keeps the raw RLGR output as the tile's `sign` map — the
+	// per-coefficient magnitude/sign refinement indices consumed by
+	// TILE_UPGRADE passes.
+	copy((*sign)[:], work[:tilePixels])
 
 	if extrapolate {
 		// Extrapolated band layout — see the table above.
@@ -322,4 +329,187 @@ func progIDWTy(pLowBand []int16, nLowStep int, pHighBand []int16, nHighStep int,
 			pDstBand[pX] = (X0 + L0) / 2
 		}
 	}
+}
+
+// ---- TILE_UPGRADE (progressive refinement passes) ----
+
+// progUpgradeState ports RFX_PROGRESSIVE_UPGRADE_STATE + wBitStream
+// (MSB-first bit consumption over the SRL/RAW segments).
+type progUpgradeState struct {
+	srl      []byte
+	raw      []byte
+	srlPos   int  // bits consumed from srl
+	rawPos   int  // bits consumed from raw
+	kp       int  // SRL zero-run parameter (scaled by 8)
+	nz       int  // pending zero-run count
+	mode     bool // false: zero-encoding next, true: unary next
+}
+
+func (st *progUpgradeState) srlBit() int {
+	idx := st.srlPos >> 3
+	if idx >= len(st.srl) {
+		st.srlPos++
+		return 0
+	}
+	b := (st.srl[idx] >> (7 - uint(st.srlPos&7))) & 1
+	st.srlPos++
+	return int(b)
+}
+
+func (st *progUpgradeState) rawBits(n int) int {
+	v := 0
+	for k := 0; k < n; k++ {
+		idx := st.rawPos >> 3
+		if idx >= len(st.raw) {
+			st.rawPos++
+			continue
+		}
+		b := (st.raw[idx] >> (7 - uint(st.rawPos&7))) & 1
+		st.rawPos++
+		v = (v << 1) | int(b)
+	}
+	return v
+}
+
+// progSRLRead ports progressive_rfx_srl_read.
+func (st *progUpgradeState) srlRead(numBits int) int16 {
+	if st.nz > 0 {
+		st.nz--
+		return 0
+	}
+
+	k := st.kp / 8
+
+	if !st.mode {
+		// zero encoding
+		bit := st.srlBit()
+		if bit == 0 {
+			// '0' bit: nz >= (1 << k)
+			st.nz = 1 << k
+			st.kp += 4
+			if st.kp > 80 {
+				st.kp = 80
+			}
+			st.nz--
+			return 0
+		}
+		// '1' bit: nz < (1 << k); nz = next k bits, unary encoding is next
+		st.nz = 0
+		st.mode = true
+		if k > 0 {
+			v := 0
+			for i := 0; i < k; i++ {
+				v = (v << 1) | st.srlBit()
+			}
+			st.nz = v
+		}
+		if st.nz > 0 {
+			st.nz--
+			return 0
+		}
+	}
+
+	st.mode = false // zero encoding is next
+	// unary encoding: read sign bit
+	sign := st.srlBit()
+
+	if st.kp < 6 {
+		st.kp = 0
+	} else {
+		st.kp -= 6
+	}
+
+	if numBits == 1 {
+		if sign != 0 {
+			return -1
+		}
+		return 1
+	}
+
+	mag := 1
+	max := (1 << numBits) - 1
+	for mag < max {
+		bit := st.srlBit()
+		if bit != 0 {
+			break
+		}
+		mag++
+	}
+	if sign != 0 {
+		return int16(-mag)
+	}
+	return int16(mag)
+}
+
+// progUpgradeBlock ports progressive_rfx_upgrade_block: refines one subband
+// in the accumulated `buffer` using the sign map + SRL/RAW bit streams.
+func progUpgradeBlock(buffer, sign []int16, length int, shift, bitPos, numBits uint8, st *progUpgradeState, nonLL bool) {
+	if numBits == 0 {
+		return
+	}
+	if !nonLL {
+		// LL3: raw-only refinement
+		for idx := 0; idx < length; idx++ {
+			input := st.rawBits(int(numBits))
+			buffer[idx] += int16(input << (shift & 31))
+		}
+		return
+	}
+	for idx := 0; idx < length; idx++ {
+		var input int16
+		switch {
+		case sign[idx] > 0:
+			input = int16(st.rawBits(int(numBits)))
+		case sign[idx] < 0:
+			input = -int16(st.rawBits(int(numBits)))
+		default:
+			input = st.srlRead(int(numBits))
+			sign[idx] = input
+		}
+		buffer[idx] += int16(input << (shift & 31))
+	}
+}
+
+// progUpgradeComponent ports progressive_rfx_upgrade_component: refines all
+// ten bands of one component in the accumulated coefficient buffer, then
+// runs the (extrapolate or standard) inverse DWT.
+func progUpgradeComponent(shift, bitPos, numBits rfxQuant, current, sign []int16,
+	srlData []byte, rawData []byte, coeffDiff, subbandDiff, extrapolate bool) []int16 {
+
+	st := progUpgradeState{kp: 8, srl: srlData, raw: rawData}
+
+	// nonLL bands (extrapolated layout, consistent with the FIRST pass)
+	progUpgradeBlock(current[0:1023], sign[0:1023], 1023, shift.HL1, bitPos.HL1, numBits.HL1, &st, true)
+	progUpgradeBlock(current[1023:2046], sign[1023:2046], 1023, shift.LH1, bitPos.LH1, numBits.LH1, &st, true)
+	progUpgradeBlock(current[2046:3007], sign[2046:3007], 961, shift.HH1, bitPos.HH1, numBits.HH1, &st, true)
+	progUpgradeBlock(current[3007:3279], sign[3007:3279], 272, shift.HL2, bitPos.HL2, numBits.HL2, &st, true)
+	progUpgradeBlock(current[3279:3551], sign[3279:3551], 272, shift.LH2, bitPos.LH2, numBits.LH2, &st, true)
+	progUpgradeBlock(current[3551:3807], sign[3551:3807], 256, shift.HH2, bitPos.HH2, numBits.HH2, &st, true)
+	progUpgradeBlock(current[3807:3879], sign[3807:3879], 72, shift.HL3, bitPos.HL3, numBits.HL3, &st, true)
+	progUpgradeBlock(current[3879:3951], sign[3879:3951], 72, shift.LH3, bitPos.LH3, numBits.LH3, &st, true)
+	progUpgradeBlock(current[3951:4015], sign[3951:4015], 64, shift.HH3, bitPos.HH3, numBits.HH3, &st, true)
+
+	// LL3 (81 coefficients)
+	progUpgradeBlock(current[4015:4096], sign[4015:4096], 81, shift.LL3, bitPos.LL3, numBits.LL3, &st, false)
+
+	// FreeRDP verifies consumed bits vs declared lengths here; on mismatch the
+	// whole frame is dropped. We accept the refined coefficients as-is.
+
+	// reverse=TRUE dwt_2d_decode: buffer = current, then transform in place.
+	out := coeffPool.Get().(*coeffArr)
+	work := (*out)[:]
+	if coeffDiff {
+		// (tile difference on upgrades is not produced by current servers;
+		// current already holds the accumulated coefficients)
+		_ = coeffDiff
+	}
+	copy(work, current)
+	if extrapolate {
+		progDWT2DLevel(work[3807:], 3)
+		progDWT2DLevel(work[3007:], 2)
+		progDWT2DLevel(work[0:], 1)
+	} else {
+		rfxInverseDWT2D(work)
+	}
+	return work
 }

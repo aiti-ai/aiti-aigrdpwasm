@@ -830,6 +830,14 @@ func (g *RdpClient) OnReady(f func()) *RdpClient {
 // For compressed bitmaps, Bitmap.Data is borrowed from an internal pool and
 // is valid only for the duration of the paint call. If you need to retain
 // the raw pixel data beyond paint, copy it or call bm.RGBA() inside paint.
+// CodecCounts returns surface-codec arrival counts from the active GFX handler.
+func (g *RdpClient) CodecCounts() map[uint16]int {
+	if g.gfxHandler == nil {
+		return nil
+	}
+	return g.gfxHandler.CodecCounts()
+}
+
 func (g *RdpClient) OnBitmap(paint func([]Bitmap)) *RdpClient {
 	g.onBitmapPaintFn = paint
 	if g.pdu == nil {
