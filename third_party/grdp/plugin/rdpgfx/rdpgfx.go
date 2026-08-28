@@ -2656,27 +2656,57 @@ func decodeSubcodec(data []byte, surfW int, out []byte) {
 		off += bmpLen
 
 		if subcodecId == 0 {
-			// RAW BGR
-			rowSrc := int(width) * 3
-			rowDst := surfW * 4
-			for y := 0; y < int(height); y++ {
-				srcStart := y * rowSrc
-				srcEnd := srcStart + rowSrc
-				dy := int(yStart) + y
-				dstStart := dy*rowDst + int(xStart)*4
-				dstEnd := dstStart + int(width)*4
-				if srcEnd > len(bmpData) || dstStart < 0 || dstEnd > len(out) {
-					continue
+			// RAW. Windows Server 2022 empirically sends this payload in the
+			// SURFACE pixel format (BGRX32, 4 bytes/pixel, bitmapDataByteCount
+			// == width*height*4) even though MS-RDPEGFX names it BGR24 —
+			// decoding as 3 bytes/pixel produces stride-shifted noise. Detect
+			// by size and handle both layouts.
+			if len(bmpData) >= int(width)*int(height)*4 {
+				// BGRX32 path
+				rowSrc := int(width) * 4
+				rowDst := surfW * 4
+				for y := 0; y < int(height); y++ {
+					srcStart := y * rowSrc
+					dy := int(yStart) + y
+					dstStart := dy*rowDst + int(xStart)*4
+					dstEnd := dstStart + int(width)*4
+					if srcStart+rowSrc > len(bmpData) || dstStart < 0 || dstEnd > len(out) {
+						continue
+					}
+					src := bmpData[srcStart : srcStart+rowSrc : srcStart+rowSrc]
+					dst := out[dstStart:dstEnd:dstEnd]
+					for x := 0; x < int(width); x++ {
+						si := x * 4
+						di := x * 4
+						dst[di] = src[si]
+						dst[di+1] = src[si+1]
+						dst[di+2] = src[si+2]
+						dst[di+3] = 0xFF
+					}
 				}
-				src := bmpData[srcStart:srcEnd:srcEnd]
-				dst := out[dstStart:dstEnd:dstEnd]
-				for x := 0; x < int(width); x++ {
-					si := x * 3
-					di := x * 4
-					dst[di] = src[si]
-					dst[di+1] = src[si+1]
-					dst[di+2] = src[si+2]
-					dst[di+3] = 0xFF
+			} else {
+				// BGR24 path (spec literal)
+				rowSrc := int(width) * 3
+				rowDst := surfW * 4
+				for y := 0; y < int(height); y++ {
+					srcStart := y * rowSrc
+					srcEnd := srcStart + rowSrc
+					dy := int(yStart) + y
+					dstStart := dy*rowDst + int(xStart)*4
+					dstEnd := dstStart + int(width)*4
+					if srcEnd > len(bmpData) || dstStart < 0 || dstEnd > len(out) {
+						continue
+					}
+					src := bmpData[srcStart:srcEnd:srcEnd]
+					dst := out[dstStart:dstEnd:dstEnd]
+					for x := 0; x < int(width); x++ {
+						si := x * 3
+						di := x * 4
+						dst[di] = src[si]
+						dst[di+1] = src[si+1]
+						dst[di+2] = src[si+2]
+						dst[di+3] = 0xFF
+					}
 				}
 			}
 		} else if subcodecId == 1 {
