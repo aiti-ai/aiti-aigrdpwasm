@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"image"
-	"image/color"
 	"image/png"
 	"log/slog"
 	"net"
@@ -33,25 +32,32 @@ func main() {
 	// so CAPS_ADVERTISE declares AVC420 support — which makes Windows send ClearCodec).
 	c.OnH264Raw(func(dx, dy, w, h int, isKey bool, data []byte) { fmt.Println("H264 frame", dx, dy, w, h, "key=", isKey, "len=", len(data)) })
 	n := 0
+	// Full-canvas compositing: paint every block onto a 1280x800 surface.
+	canvasImg := image.NewRGBA(image.Rect(0, 0, 1280, 800))
 	c.OnBitmap(func(bs []grdp.Bitmap) {
 		for _, b := range bs {
 			fmt.Printf("BMP t=%.1f L=%d T=%d R=%d B=%d W=%d H=%d dataLen=%d\n",
 				time.Since(start).Seconds(), b.DestLeft, b.DestTop, b.DestRight, b.DestBottom, b.Width, b.Height, len(b.Data))
-			if n < 12 && b.BitsPerPixel == 4 {
-				img := image.NewRGBA(image.Rect(0, 0, b.Width, b.Height))
-				for y := 0; y < b.Height; y++ {
-					for x := 0; x < b.Width; x++ {
+			if b.BitsPerPixel == 4 {
+				for y := 0; y < b.Height && b.DestTop+y < 800; y++ {
+					for x := 0; x < b.Width && b.DestLeft+x < 1280; x++ {
 						i := (y*b.Width + x) * 4
 						if i+3 < len(b.Data) {
-							img.SetRGBA(x, y, color.RGBA{R: b.Data[i+2], G: b.Data[i+1], B: b.Data[i], A: 0xFF})
+							di := ((b.DestTop+y)*1280 + (b.DestLeft + x)) * 4
+							canvasImg.Pix[di] = b.Data[i+2]
+							canvasImg.Pix[di+1] = b.Data[i+1]
+							canvasImg.Pix[di+2] = b.Data[i]
+							canvasImg.Pix[di+3] = 0xFF
 						}
 					}
 				}
-				f, _ := os.Create(fmt.Sprintf("/tmp/repro-bmp-%d-L%d-T%d.png", n, b.DestLeft, b.DestTop))
-				png.Encode(f, img)
-				f.Close()
-				n++
 			}
+			n++
+		}
+		if n%5 == 0 || n == 1 {
+			f, _ := os.Create(fmt.Sprintf("/tmp/repro-full-%d.png", n))
+			png.Encode(f, canvasImg)
+			f.Close()
 		}
 	})
 	c.OnError(func(err error) { fmt.Println("onError:", err) })
@@ -61,5 +67,5 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("LOGIN OK")
-	time.Sleep(30 * time.Second)
+	time.Sleep(55 * time.Second)
 }

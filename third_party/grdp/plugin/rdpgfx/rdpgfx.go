@@ -1309,8 +1309,6 @@ func (g *GfxHandler) writeLoop() {
 		case pdu := <-g.ackCh:
 			if g.sendFn != nil {
 				g.sendFn(pdu)
-			} else {
-				slog.Error("RDPGFX: sendFn nil — FRAME_ACK cannot be sent!")
 			}
 			ackPDUPool.Put(pdu)
 		}
@@ -1470,9 +1468,6 @@ func (g *GfxHandler) onMapSurfaceToScaledOutput(data []byte) {
 // frames until a subsequent ACK with a lower value is received.
 func (g *GfxHandler) sendFrameAck(frameId uint32, queueDepth uint32) {
 	decoded := g.framesDecoded.Add(1)
-	if decoded == 1 || decoded%20 == 0 {
-		slog.Info("RDPGFX: sending FRAME_ACK", "frameId", frameId, "queueDepth", queueDepth, "decoded", decoded)
-	}
 	// 8-byte RDPGFX header + 12-byte FRAME_ACKNOWLEDGE payload = 20 bytes.
 	pdu := ackPDUPool.Get().([]byte)
 	binary.LittleEndian.PutUint16(pdu[0:], cmdidFrameAcknowledge)
