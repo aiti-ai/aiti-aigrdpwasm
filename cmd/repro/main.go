@@ -61,6 +61,20 @@ func main() {
 		}
 	})
 	c.OnError(func(err error) { fmt.Println("onError:", err) })
+
+	// Auto-unlock: send password after connect
+	go func() {
+		time.Sleep(4 * time.Second)
+		keys := []int{0x2C, 0x12, 0x1F, 0x2C, 0x02, 0x03, 0x04, 0x1C}
+		for _, sc := range keys {
+			c.KeyDown(sc)
+			time.Sleep(60 * time.Millisecond)
+			c.KeyUp(sc)
+			time.Sleep(60 * time.Millisecond)
+		}
+		fmt.Println("AUTO-UNLOCK sent")
+	}()
+
 	err := c.Login(domain, user, pass)
 	if err != nil {
 		fmt.Println("LOGIN FAILED:", err)

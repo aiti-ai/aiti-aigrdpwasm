@@ -217,7 +217,7 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 			copy(d, bs[i].Data)
 			bs[i].Data = d
 		}
-		go renderBitmaps(bs)
+		renderBitmaps(bs)
 	})
 
 	g.OnClipboard(
