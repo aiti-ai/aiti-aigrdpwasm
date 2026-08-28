@@ -1,6 +1,7 @@
 package core
 
 import (
+	"os"
 	"bufio"
 	"crypto/ecdsa"
 	"crypto/rsa"
@@ -81,6 +82,13 @@ func (s *SocketLayer) StartTLS() error {
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS12,
 		//		MaxVersion:               tls.VersionTLS13,
+	}
+	// RDP_TLS_KEYLOG: dump TLS session keys for wireshark/tshark decryption of
+	// server-side drops (native builds only — wasm has no filesystem).
+	if p := os.Getenv("RDP_TLS_KEYLOG"); p != "" {
+		if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			config.KeyLogWriter = f
+		}
 	}
 	tlsConn := tls.Client(s.conn, config)
 	if err := tlsConn.Handshake(); err != nil {

@@ -1309,6 +1309,8 @@ func (g *GfxHandler) writeLoop() {
 		case pdu := <-g.ackCh:
 			if g.sendFn != nil {
 				g.sendFn(pdu)
+			} else {
+				slog.Error("RDPGFX: sendFn nil — FRAME_ACK cannot be sent!")
 			}
 			ackPDUPool.Put(pdu)
 		}
@@ -1468,6 +1470,9 @@ func (g *GfxHandler) onMapSurfaceToScaledOutput(data []byte) {
 // frames until a subsequent ACK with a lower value is received.
 func (g *GfxHandler) sendFrameAck(frameId uint32, queueDepth uint32) {
 	decoded := g.framesDecoded.Add(1)
+	if decoded == 1 || decoded%20 == 0 {
+		slog.Info("RDPGFX: sending FRAME_ACK", "frameId", frameId, "queueDepth", queueDepth, "decoded", decoded)
+	}
 	// 8-byte RDPGFX header + 12-byte FRAME_ACKNOWLEDGE payload = 20 bytes.
 	pdu := ackPDUPool.Get().([]byte)
 	binary.LittleEndian.PutUint16(pdu[0:], cmdidFrameAcknowledge)
@@ -1489,7 +1494,13 @@ func (g *GfxHandler) onEndFrame(data []byte) {
 	if len(data) < 4 {
 		return
 	}
-	realDepth := uint32(len(g.decodeCh))
+	// MS-RDPENGFX 2.2.2.9: queueDepth is "the maximum number of additional
+	// frames the client can receive" — it must be the CHANNEL CAPACITY.
+	// The original len(g.decodeCh) reports the current backlog (0 whenever
+	// the decode goroutine keeps up), which tells the server "send no more
+	// frames": the stream stalls after the first frame and the server
+	// eventually drops the session (~10-20s of garbage/blank screen).
+	realDepth := uint32(cap(g.decodeCh))
 	if hint := g.queueDepthHint.Load(); hint > realDepth {
 		realDepth = hint
 	}
