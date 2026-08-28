@@ -254,6 +254,29 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	clientMu.Lock()
 	rdpClient = g
 	clientMu.Unlock()
+
+	// Auto-unlock: if the server shows an interactive logon UI after NLA
+	// (Windows Server 2022 dockurr container does this even with
+	// INFO_AUTOLOGON), send the password as keyboard input to complete
+	// interactive logon. Harmless if already logged in.
+	go func() {
+		time.Sleep(4 * time.Second)
+		if stale() {
+			return
+		}
+		// t e s t 1 2 3 Enter (Set 1 scancodes)
+		keys := []int{0x2C, 0x12, 0x1F, 0x2C, 0x02, 0x03, 0x04, 0x1C}
+		for _, sc := range keys {
+			if stale() {
+				return
+			}
+			g.KeyDown(sc)
+			time.Sleep(60 * time.Millisecond)
+			g.KeyUp(sc)
+			time.Sleep(60 * time.Millisecond)
+		}
+		setStatusText("Connected (auto-unlock sent)")
+	}()
 	return nil
 }
 
