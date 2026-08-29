@@ -62,6 +62,8 @@ func main() {
 		for id, n := range counts {
 			parts = append(parts, fmt.Sprintf("%d:%d", id, n))
 		}
+		parts = append(parts, fmt.Sprintf("65534:%d", renderedBitmaps))
+		parts = append(parts, fmt.Sprintf("65533:%d", renderedIconRegion))
 		sort.Strings(parts)
 		return strings.Join(parts, ",")
 	}))
@@ -317,7 +319,17 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	return nil
 }
 
+var renderedBitmaps int64
+
+var renderedIconRegion int64
+
 func renderBitmaps(bs []grdp.Bitmap) {
+	renderedBitmaps += int64(len(bs))
+	for _, bm := range bs {
+		if bm.DestLeft < 300 && bm.DestTop < 200 {
+			renderedIconRegion++
+		}
+	}
 	uint8ClampedCtor := js.Global().Get("Uint8ClampedArray")
 	imageDataCtor := js.Global().Get("ImageData")
 

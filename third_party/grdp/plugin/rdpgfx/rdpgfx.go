@@ -810,7 +810,8 @@ func (g *GfxHandler) CodecCounts() map[uint16]int {
 	for k, v := range g.codecCounts {
 		out[k] = v
 	}
-	out[0xFFFF] = int(clearSubBlockCount.Load()) // sub-block decode count
+	out[0xFFFF] = int(clearSubBlockCount.Load())  // sub-block decode count
+	out[0xFFFE] = int(emittedBitmaps.Load())      // emitted bitmap count
 	return out
 }
 
@@ -824,6 +825,8 @@ func (g *GfxHandler) SetKeyframeRequestFunc(fn func()) {
 }
 
 var dumpN atomic.Int64
+
+var emittedBitmaps atomic.Int64
 
 // SetIncompatibleGfxCallback registers the "server gfx incompatible" callback.
 // Detection: when a LARGE progressive (RFX-pro) frame decodes into a nearly
@@ -2263,6 +2266,7 @@ func blitToSurface(s *surface, x, y, w, h int, src []byte) {
 // for codec output buffers that the GfxHandler owns end-to-end (currently
 // uncompressed and planar).
 func (g *GfxHandler) emitBitmapPooled(s *surface, x, y, w, h int, decoded []byte) {
+	emittedBitmaps.Add(1)
 	if !s.mapped || g.onBitmap == nil {
 		releaseBitmapBuf(decoded)
 		return
@@ -2278,6 +2282,7 @@ func (g *GfxHandler) emitBitmapPooled(s *surface, x, y, w, h int, decoded []byte
 }
 
 func (g *GfxHandler) emitBitmap(s *surface, x, y, w, h int, decoded []byte) {
+	emittedBitmaps.Add(1)
 	if !s.mapped || g.onBitmap == nil {
 		return
 	}
