@@ -286,24 +286,13 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	rdpClient = g
 	clientMu.Unlock()
 
-	// Ask for a full desktop redraw once the graphics pipeline is up: the
-	// server's tile state survives reconnects (same Windows session), so its
-	// initial render can skip tiles the previous connection already drew
-	// (missing taskbar / stale patches on the fresh client).  The DVC may not
-	// be open at 1.2s yet (send is a silent no-op then), so retry at 6s if no
-	// bitmap has rendered by then.
-	time.AfterFunc(1200*time.Millisecond, func() {
-		if stale() {
-			return
-		}
-		g.RedrawDesktop()
-	})
-	time.AfterFunc(6*time.Second, func() {
-		if stale() || renderedBitmaps != 0 {
-			return
-		}
-		g.RedrawDesktop()
-	})
+	// NOTE: the RDPEDISP full-desktop redraw (RedrawDesktop) is currently
+	// DISABLED for auto-fire.  Fixed-time or settle-triggered wobbles both
+	// correlated with the pipeline stalling at zero frames (reproducible:
+	// fast connect → wobble mid-setup → server render never arrives), and
+	// sessions went input-dead shortly after.  Re-enable only behind a
+	// verified trigger; the reconnect tile-desync it was meant to heal is
+	// rarer than the stall it caused.
 
 	// Auto-unlock: if the server shows an interactive logon UI after NLA
 	// (Windows Server 2022 dockurr container does this even with
