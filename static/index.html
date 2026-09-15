@@ -451,7 +451,7 @@
     // ships the wasm so jsDelivr can serve it, but postinstall removes the local copy
     // after install — same approach as service-tunnels' face-api models).
     // Override: URL ?wasm=<url> or localStorage['grdpwasm.wasmUrl']; default CDN -> same-origin fallback.
-    const PKG_VERSION = "0.1.0";
+    const PKG_VERSION = "0.2.0";
     function wasmSources() {
       const custom = new URLSearchParams(location.search).get("wasm")
         || localStorage.getItem("grdpwasm.wasmUrl");
@@ -461,9 +461,9 @@
       // can lag behind and silently run a stale decoder, so they are the
       // fallback, not the primary source.
       return [
-        "main.wasm",
         `https://cdn.jsdelivr.net/npm/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
         `https://unpkg.com/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
+        "main.wasm", // 同源兜底（未发布期间 CDN 404 落到这里）
       ];
     }
     async function fetchPlain(url) {
