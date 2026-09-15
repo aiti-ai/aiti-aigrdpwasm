@@ -297,30 +297,48 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	// Auto-unlock: if the server shows an interactive logon UI after NLA
 	// (Windows Server 2022 dockurr container does this even with
 	// INFO_AUTOLOGON), send the password as keyboard input to complete
-	// interactive logon. Harmless if already logged in.
+	// interactive logon.  If the session is LOCKED instead ("Press
+	// Ctrl+Alt+Delete"), the plain password keystrokes are swallowed — the
+	// SAS must go first — so later attempts prepend Ctrl+Alt+Del.  A session
+	// already sitting at the desktop gets stray keystrokes; that is the
+	// accepted cost of a blind unlock (kept for the container boot flow).
 	go func() {
-		time.Sleep(4 * time.Second)
-		if stale() {
-			return
+		// t e s t 1 2 3 Enter (Set 1 scancodes; 0x14='t' — 0x2C is 'z')
+		password := []int{0x14, 0x12, 0x1F, 0x14, 0x02, 0x03, 0x04, 0x1C}
+		const lctrl, lalt, del = 0x1D, 0x38, 0xE053
+		type attempt struct {
+			delay time.Duration
+			cad   bool
 		}
-		// t e s t 1 2 3 Enter (Set 1 scancodes)
-		keys := []int{0x2C, 0x12, 0x1F, 0x2C, 0x02, 0x03, 0x04, 0x1C}
-		for _, sc := range keys {
+		for _, a := range []attempt{{4 * time.Second, false}, {20 * time.Second, true}, {45 * time.Second, true}} {
+			time.Sleep(a.delay)
 			if stale() {
 				return
 			}
-			g.KeyDown(sc)
-			time.Sleep(60 * time.Millisecond)
-			g.KeyUp(sc)
-			time.Sleep(60 * time.Millisecond)
-		}
-		setStatusText("Connected (auto-unlock sent)")
-		// Nudge the mouse to the centre: Windows uses incremental updates —
-		// a static desktop produces no further frames. A mouse-move after
-		// logon triggers the server to send the cursor + surrounding area,
-		// kick-starting the visible desktop.
-		time.Sleep(500 * time.Millisecond)
-		if !stale() {
+			if a.cad {
+				g.KeyDown(lctrl)
+				g.KeyDown(lalt)
+				g.KeyDown(del)
+				time.Sleep(120 * time.Millisecond)
+				g.KeyUp(del)
+				g.KeyUp(lalt)
+				g.KeyUp(lctrl)
+				time.Sleep(2500 * time.Millisecond) // logon screen transition
+			}
+			for _, sc := range password {
+				if stale() {
+					return
+				}
+				g.KeyDown(sc)
+				time.Sleep(60 * time.Millisecond)
+				g.KeyUp(sc)
+				time.Sleep(60 * time.Millisecond)
+			}
+			setStatusText("Connected (auto-unlock sent)")
+			time.Sleep(800 * time.Millisecond)
+			if stale() {
+				return
+			}
 			g.MouseMove(640, 400)
 		}
 	}()
