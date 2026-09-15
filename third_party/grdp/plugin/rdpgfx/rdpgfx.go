@@ -261,6 +261,13 @@ type ClearSession struct {
 	ctx *clearCodecCtx
 }
 
+// DecodeInto decodes one ClearCodec payload onto the surface region at
+// (left,top) — same compositing semantics as the live path (tile base =
+// current surface pixels, result written back).
+func (s *ClearSession) DecodeInto(payload []byte, surf []byte, surfW, surfH, left, top int) {
+	s.ctx.decodeInto(payload, surfW, surfH, surf, surfW, surfH, left, top)
+}
+
 // NewClearSession creates a ClearCodec session with persistent cache state.
 func NewClearSession() *ClearSession { return &ClearSession{ctx: newClearCodecCtx()} }
 
@@ -838,6 +845,20 @@ func (g *GfxHandler) SetKeyframeRequestFunc(fn func()) {
 }
 
 var dumpN atomic.Int64
+
+// dumpGfxOrdered writes one graphics payload into RDPGFX_DUMP_DIR with a shared
+// monotonically increasing sequence number, so WTS1/WTS2 frames can be replayed
+// in wire order (offline dual-codec debugging). Coordinates: WTS1 dest rect,
+// WTS2 is full-surface (0,0).
+func (g *GfxHandler) dumpGfxOrdered(kind string, left, top, w, h int, data []byte) {
+	dir := os.Getenv("RDPGFX_DUMP_DIR")
+	if dir == "" {
+		return
+	}
+	n := dumpSeqN.Add(1)
+	os.WriteFile(fmt.Sprintf("%s/gfx-%06d-%s-%d-%d-%dx%d.bin", dir, n, kind, left, top, w, h), data, 0644)
+}
+var dumpSeqN atomic.Int64
 
 var emittedBitmaps atomic.Int64
 
@@ -1652,6 +1673,7 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// bands / subcodecs (RAW + NSCodec + RLEX). Fixes Windows 8.1+ which
 		// prefers ClearCodec for UI surfaces — without decoding it the client
 		// black-screens and the server drops the session.
+		g.dumpGfxOrdered("clear", int(left), int(top), w, h, bmpData)
 		if p := os.Getenv("RDPGFX_DUMP_CLEAR"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
 			max := 20
@@ -1671,6 +1693,7 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// progressive and decode fine, so codec type alone is not a verdict; the
 		// incompatibility decision happens at demand-active server bitmap codecs
 		// (see the ready callback in grdp.go)
+		g.dumpGfxOrdered("prog", int(left), int(top), w, h, bmpData)
 		if p := os.Getenv("RDPGFX_DUMP_PROG"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
 			if dumpN.Load() <= 40 {
@@ -1832,6 +1855,7 @@ func (g *GfxHandler) onWireToSurface2Decode(data []byte, skipHeavy bool) {
 			"w", w, "h", h, "bmpLen", bmpLen)
 	}
 
+	g.dumpGfxOrdered("wts2", 0, 0, w, h, bmpData)
 	var decoded []byte
 	switch codecId {
 	case codecUncompressed:

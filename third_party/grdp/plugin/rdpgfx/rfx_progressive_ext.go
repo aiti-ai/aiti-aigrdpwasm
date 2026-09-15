@@ -492,6 +492,16 @@ func progUpgradeComponent(shift, bitPos, numBits rfxQuant, current, sign []int16
 	// LL3 (81 coefficients)
 	progUpgradeBlock(current[4015:4096], sign[4015:4096], 81, shift.LL3, bitPos.LL3, numBits.LL3, &st, false)
 
+	// FreeRDP length verification: consumed bits must match declared lengths
+	// (progressive.c returns -1 for the whole tile on mismatch). Zero fires on
+	// real Windows Server captures — kept as a cheap invariant guard.
+	if aSrl := (st.srlPos + 7) / 8; aSrl != len(srlData) {
+		slog.Debug("RFX upgrade SRL length mismatch", "consumed", aSrl, "declared", len(srlData))
+	}
+	if aRaw := (st.rawPos + 7) / 8; aRaw != len(rawData) {
+		slog.Debug("RFX upgrade RAW length mismatch", "consumed", aRaw, "declared", len(rawData))
+	}
+
 	// FreeRDP verifies consumed bits vs declared lengths here; on mismatch the
 	// whole frame is dropped. We accept the refined coefficients as-is.
 
@@ -530,4 +540,10 @@ func (p *ProgSession) Decode(payload []byte, w, h int) []byte {
 	}
 	p.d.progressiveDecode(payload, out, w, h)
 	return out
+}
+
+// DecodeInto decodes one progressive frame directly onto the persistent
+// surface buffer (same semantics as the live path).
+func (p *ProgSession) DecodeInto(payload []byte, surf []byte, w, h int) {
+	p.d.progressiveDecode(payload, surf, w, h)
 }

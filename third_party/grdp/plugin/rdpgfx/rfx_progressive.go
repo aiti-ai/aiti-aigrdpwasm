@@ -259,7 +259,7 @@ func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, 
 		case progWBTTileSimple, progWBTTileFirst, progWBTTileUpgrade:
 			tiles = append(tiles, rfxProgTileWork{tileType: tileType, data: data[offset+6 : offset+tileLen]})
 		default:
-			slog.Debug("RFX: unknown progressive tile type", "type", tileType)
+			slog.Warn("RFX: unknown progressive tile type", "type", tileType)
 		}
 		offset += tileLen
 	}
@@ -267,6 +267,12 @@ func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, 
 
 	const parallelTileThreshold = 1 << 20
 	decodeTile := func(tw rfxProgTileWork, parallel bool) {
+		if tw.tileType == progWBTTileUpgrade && len(tw.data) >= 20 {
+			slog.Warn("RFX TILE upgrade", "xIdx", binary.LittleEndian.Uint16(tw.data[3:]), "yIdx", binary.LittleEndian.Uint16(tw.data[5:]), "quality", tw.data[7], "ySrl", binary.LittleEndian.Uint16(tw.data[9:]), "yRaw", binary.LittleEndian.Uint16(tw.data[11:]))
+		}
+		if tw.tileType != progWBTTileUpgrade && len(tw.data) >= 12 {
+			slog.Warn("RFX TILE first/simple", "type", tw.tileType, "xIdx", binary.LittleEndian.Uint16(tw.data[3:]), "yIdx", binary.LittleEndian.Uint16(tw.data[5:]), "flags", tw.data[7], "quality", tw.data[8])
+		}
 		switch tw.tileType {
 		case progWBTTileSimple:
 			d.decodeTileSimple(tw.data, quants, progQuants, surfData, outW, outH, extrapolate, parallel)
@@ -391,7 +397,7 @@ func (d *rfxProgressiveDecoder) decodeTilePass(data []byte, quants []rfxQuant, p
 	}
 	prog, ok := resolveProgQuant(h.quality, progQuants)
 	if !ok {
-		slog.Debug("RFX: tile quality out of range", "quality", h.quality, "numProgQuant", len(progQuants))
+		slog.Warn("RFX: tile quality out of range", "quality", h.quality, "numProgQuant", len(progQuants))
 		return
 	}
 
@@ -501,7 +507,7 @@ func (d *rfxProgressiveDecoder) decodeTileUpgrade(data []byte, quants []rfxQuant
 
 	prog, ok := resolveProgQuant(h.quality, progQuants)
 	if !ok {
-		slog.Debug("RFX: upgrade tile quality out of range", "quality", h.quality)
+		slog.Warn("RFX: upgrade tile quality out of range", "quality", h.quality, "numProgQuant", len(progQuants))
 		return
 	}
 
@@ -512,7 +518,7 @@ func (d *rfxProgressiveDecoder) decodeTileUpgrade(data []byte, quants []rfxQuant
 	d.mu.Unlock()
 	if cur == nil {
 		// 没有 FIRST pass 基底，无法 upgrade
-		slog.Debug("RFX: TILE_UPGRADE without cached tile, skipping")
+		slog.Warn("RFX: TILE_UPGRADE without cached tile, skipping", "xIdx", h.xIdx, "yIdx", h.yIdx, "cacheSize", len(d.tileCache))
 		return
 	}
 
