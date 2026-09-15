@@ -267,12 +267,6 @@ func (d *rfxProgressiveDecoder) parseRegion(data []byte, surfData []byte, outW, 
 
 	const parallelTileThreshold = 1 << 20
 	decodeTile := func(tw rfxProgTileWork, parallel bool) {
-		if tw.tileType == progWBTTileUpgrade && len(tw.data) >= 20 {
-			slog.Warn("RFX TILE upgrade", "xIdx", binary.LittleEndian.Uint16(tw.data[3:]), "yIdx", binary.LittleEndian.Uint16(tw.data[5:]), "quality", tw.data[7], "ySrl", binary.LittleEndian.Uint16(tw.data[9:]), "yRaw", binary.LittleEndian.Uint16(tw.data[11:]))
-		}
-		if tw.tileType != progWBTTileUpgrade && len(tw.data) >= 12 {
-			slog.Warn("RFX TILE first/simple", "type", tw.tileType, "xIdx", binary.LittleEndian.Uint16(tw.data[3:]), "yIdx", binary.LittleEndian.Uint16(tw.data[5:]), "flags", tw.data[7], "quality", tw.data[8])
-		}
 		switch tw.tileType {
 		case progWBTTileSimple:
 			d.decodeTileSimple(tw.data, quants, progQuants, surfData, outW, outH, extrapolate, parallel)

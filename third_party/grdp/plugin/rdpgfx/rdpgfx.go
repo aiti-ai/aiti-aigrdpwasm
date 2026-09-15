@@ -1437,6 +1437,21 @@ func (g *GfxHandler) sendPdu(cmdId uint16, payload []byte) {
 	pduBufPool.Put(buf[:0])
 }
 
+// RequestResetGraphics sends the client→server Reset Graphics PDU
+// (MS-RDPEGFX 2.2.2.2): the server must respond with a full desktop redraw.
+// Needed after reconnects — the server's progressive/clear tile state is
+// continuous across RDP connections of the same session, so its first render
+// may skip tiles it believes unchanged from the previous connection (missing
+// taskbar / stale patches on the fresh client).
+func (g *GfxHandler) RequestResetGraphics(width, height int) {
+	payload := make([]byte, 12)
+	binary.LittleEndian.PutUint32(payload[0:], uint32(width))
+	binary.LittleEndian.PutUint32(payload[4:], uint32(height))
+	// padding(4) stays zero
+	g.sendPdu(cmdidResetGraphics, payload)
+	slog.Info("RDPGFX: client Reset Graphics sent", "w", width, "h", height)
+}
+
 // --- Command Handlers ---
 
 func (g *GfxHandler) onCapsConfirm(data []byte) {

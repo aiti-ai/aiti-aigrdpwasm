@@ -286,6 +286,25 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	rdpClient = g
 	clientMu.Unlock()
 
+	// Ask for a full desktop redraw once the graphics pipeline is up: the
+	// server's tile state survives reconnects (same Windows session), so its
+	// initial render can skip tiles the previous connection already drew
+	// (missing taskbar / stale patches on the fresh client).  The DVC may not
+	// be open at 1.2s yet (send is a silent no-op then), so retry at 6s if no
+	// bitmap has rendered by then.
+	time.AfterFunc(1200*time.Millisecond, func() {
+		if stale() {
+			return
+		}
+		g.RedrawDesktop()
+	})
+	time.AfterFunc(6*time.Second, func() {
+		if stale() || renderedBitmaps != 0 {
+			return
+		}
+		g.RedrawDesktop()
+	})
+
 	// Auto-unlock: if the server shows an interactive logon UI after NLA
 	// (Windows Server 2022 dockurr container does this even with
 	// INFO_AUTOLOGON), send the password as keyboard input to complete

@@ -778,6 +778,33 @@ func (g *RdpClient) handleRedirect(redir *pdu.ServerRedirectionPDU) {
 	g.reregisterCallbacks()
 }
 
+// RedrawDesktop forces the server to re-render the entire desktop by wobbling
+// the display resolution over the RDPEDISP channel: a monitor-layout change
+// always triggers a full desktop repaint server-side (unlike the RDPGFX Reset
+// Graphics PDU, which the server may acknowledge without repainting).  Use
+// after reconnects — the server's graphics state persists across RDP
+// connections of the same session, so its initial render can omit tiles it
+// believes unchanged from the previous connection (missing taskbar / stale
+// patches on the fresh client).
+func (g *RdpClient) RedrawDesktop() {
+	if g.dispHandler == nil {
+		return
+	}
+	mon := func(w uint32) []rdpedisp.Monitor {
+		return []rdpedisp.Monitor{{
+			Flags:              rdpedisp.MonitorFlagPrimary,
+			Width:              w,
+			Height:             uint32(g.height),
+			DesktopScaleFactor: 100,
+			DeviceScaleFactor:  100,
+		}}
+	}
+	g.dispHandler.SendMonitorLayout(mon(uint32(g.width) + 2))
+	time.AfterFunc(400*time.Millisecond, func() {
+		g.dispHandler.SendMonitorLayout(mon(uint32(g.width)))
+	})
+}
+
 func (g *RdpClient) Width() int {
 	return g.width
 }

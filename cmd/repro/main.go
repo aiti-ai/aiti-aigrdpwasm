@@ -82,17 +82,20 @@ func main() {
 	})
 	c.OnError(func(err error) { fmt.Println("onError:", err) })
 
-	// Auto-unlock: send password after connect
+	// Auto-unlock: send password after connect (twice — the logon UI may not
+	// be ready for the first round)
 	go func() {
-		time.Sleep(4 * time.Second)
-		keys := []int{0x2C, 0x12, 0x1F, 0x2C, 0x02, 0x03, 0x04, 0x1C}
-		for _, sc := range keys {
-			c.KeyDown(sc)
-			time.Sleep(60 * time.Millisecond)
-			c.KeyUp(sc)
-			time.Sleep(60 * time.Millisecond)
+		for _, delay := range []time.Duration{4 * time.Second, 20 * time.Second} {
+			time.Sleep(delay)
+			keys := []int{0x2C, 0x12, 0x1F, 0x2C, 0x02, 0x03, 0x04, 0x1C}
+			for _, sc := range keys {
+				c.KeyDown(sc)
+				time.Sleep(60 * time.Millisecond)
+				c.KeyUp(sc)
+				time.Sleep(60 * time.Millisecond)
+			}
+			fmt.Println("AUTO-UNLOCK sent @", delay)
 		}
-		fmt.Println("AUTO-UNLOCK sent")
 	}()
 
 	err := c.Login(domain, user, pass)
@@ -101,19 +104,26 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("LOGIN OK")
+	if os.Getenv("REPRO_RESET") != "" {
+		go func() {
+			time.Sleep(20 * time.Second)
+			c.RedrawDesktop()
+			fmt.Println("RESET-GRAPHICS sent @20s")
+		}()
+	}
 
-	// 刺激 UI 变化以捕获 TILE_UPGRADE 帧：Ctrl+Esc 打开开始菜单，
-	// 数秒后 Esc 关闭，重复两次。
+	// 刺激 UI 变化以捕获菜单 tile：等 auto-unlock 登录动画完成后
+	// Ctrl+Esc 打开开始菜单，数秒后 Esc 关闭，重复两轮。
 	go func() {
-		time.Sleep(8 * time.Second)
-		for round := 0; round < 2; round++ {
+		time.Sleep(32 * time.Second)
+		for round := 0; round < 3; round++ {
 			fmt.Println("STIM: Ctrl+Esc (start menu)")
 			c.KeyDown(0x1D) // Ctrl
 			c.KeyDown(0x01) // Esc
 			time.Sleep(120 * time.Millisecond)
 			c.KeyUp(0x01)
 			c.KeyUp(0x1D)
-			time.Sleep(9 * time.Second)
+			time.Sleep(14 * time.Second)
 			c.KeyDown(0x01) // Esc 关闭菜单
 			time.Sleep(100 * time.Millisecond)
 			c.KeyUp(0x01)
@@ -121,5 +131,5 @@ func main() {
 		}
 	}()
 
-	time.Sleep(55 * time.Second)
+	time.Sleep(110 * time.Second)
 }
