@@ -16,7 +16,13 @@ func TestNewNegotiateMessage(t *testing.T) {
 	struc.Pack(buff, negoMsg)
 
 	result := hex.EncodeToString(buff.Bytes())
-	expected := "4e544c4d535350000100000035820860000000000000000000000000000000000000000000000000"
+	// The Version field is serialized only when NEGOTIATE_VERSION is set
+	// (MS-NLMP); NewNTLMv2 with an empty domain does not set it, so the
+	// negotiate message is 32 bytes.  The old upstream expectation carried an
+	// unconditional 12-byte Version tail and broke when the conditional
+	// Version handling landed (verified against GDS 3389, xrdp 3390 and
+	// Windows Server 2022 13389 - LOGIN OK on all three).
+	expected := "4e544c4d53535000010000003582086000000000000000000000000000000000"
 
 	if result != expected {
 		t.Error(result, " not equals to", expected)
