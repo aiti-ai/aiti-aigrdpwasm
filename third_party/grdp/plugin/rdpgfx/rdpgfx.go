@@ -1,6 +1,7 @@
 package rdpgfx
 
 import (
+	"strconv"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -207,17 +208,29 @@ type vBarEntry struct {
 	count  int
 }
 
+const (
+	clearFlagGlyphIndex  = 0x01
+	clearFlagGlyphHit    = 0x02
+	clearFlagCacheReset  = 0x04
+	clearGlyphCacheSize  = 4000
+	clearGlyphMaxTilePix = 1024 * 1024 // FreeRDP clear.c glyph size limit
+)
+
 type clearCodecCtx struct {
 	vBarStorage      []vBarEntry
 	shortVBarStorage []vBarEntry
 	vBarCursor       int
 	shortVBarCursor  int
+	seqNumber        uint8
+	seqStarted       bool
+	glyphCache       [][]byte // per-index w*h*4 BGRA tile snapshots (nil = empty)
 }
 
 func newClearCodecCtx() *clearCodecCtx {
 	return &clearCodecCtx{
 		vBarStorage:      make([]vBarEntry, 32768),
 		shortVBarStorage: make([]vBarEntry, 16384),
+		glyphCache:       make([][]byte, clearGlyphCacheSize),
 	}
 }
 
@@ -1641,7 +1654,13 @@ func (g *GfxHandler) onWireToSurface1Decode(data []byte, skipHeavy bool) {
 		// black-screens and the server drops the session.
 		if p := os.Getenv("RDPGFX_DUMP_CLEAR"); p != "" {
 			dumpN.Store(dumpN.Load() + 1)
-			if dumpN.Load() <= 20 {
+			max := 20
+			if v := os.Getenv("RDPGFX_DUMP_CLEAR_MAX"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					max = n
+				}
+			}
+			if dumpN.Load() <= int64(max) {
 				os.WriteFile(fmt.Sprintf("%s/clear-wts2-%02d_%dx%d.bin", p, dumpN.Load(), w, h), bmpData, 0644)
 			}
 		}
@@ -2526,18 +2545,78 @@ func (ctx *clearCodecCtx) decodeInto(data []byte, w, h int, surfData []byte, sur
 }
 
 func (ctx *clearCodecCtx) decodeIntoBuf(data []byte, w, h int, out []byte) {
-	// WTS1 bitmapData layout: glyphFlags(1) + seqNumber(1), then the ClearCodec
-	// composition payload (residual/bands/subcodec counts + data). Skip the
-	// 2-byte prefix; glyph segments are not used by current servers.
-	if len(data) < 14 {
+	// WTS1 bitmapData layout (MS-RDPECLEARCODEC 4.4.2.4 / FreeRDP clear.c):
+	// glyphFlags(1) + seqNumber(1), then — only when GLYPH_INDEX is set —
+	// glyphIndex(2), then the 12-byte section counts and section data.
+	// Windows Server 2022 uses the glyph cache for text tiles: INDEX frames
+	// carry 2 extra bytes (parsing counts at offset 2 misreads them) and HIT
+	// frames carry no sections at all — the tile must come from the cache.
+	if len(data) < 2 {
 		slog.Warn("CLEAR: payload too short", "len", len(data))
 		return
 	}
-	// Direct binary indexing — avoids bytes.NewReader and per-field interface dispatch.
-	residualLen := int(binary.LittleEndian.Uint32(data[2:]))
-	bandsLen := int(binary.LittleEndian.Uint32(data[6:]))
-	subcodecLen := int(binary.LittleEndian.Uint32(data[10:]))
-	off := 14
+	glyphFlags := data[0]
+	seqNumber := data[1]
+
+	if !ctx.seqStarted {
+		ctx.seqNumber = seqNumber
+		ctx.seqStarted = true
+	}
+	if seqNumber != ctx.seqNumber {
+		// FreeRDP fails the whole frame on seq mismatch — mirror that (no paint).
+		slog.Warn("CLEAR: seq mismatch", "got", seqNumber, "want", ctx.seqNumber)
+		return
+	}
+	ctx.seqNumber = seqNumber + 1
+
+	if glyphFlags&clearFlagCacheReset != 0 {
+		ctx.vBarCursor = 0
+		ctx.shortVBarCursor = 0
+	}
+
+	off := 2
+	glyphIndex := -1
+	if glyphFlags&clearFlagGlyphIndex != 0 {
+		if len(data) < off+2 {
+			slog.Warn("CLEAR: payload too short for glyphIndex", "len", len(data))
+			return
+		}
+		glyphIndex = int(binary.LittleEndian.Uint16(data[off:]))
+		off += 2
+		if glyphIndex >= clearGlyphCacheSize || w*h > clearGlyphMaxTilePix {
+			slog.Warn("CLEAR: glyph index/size out of range", "idx", glyphIndex, "pix", w*h)
+			return
+		}
+	}
+
+	if glyphFlags&clearFlagGlyphHit != 0 {
+		// GLYPH_HIT is only valid together with GLYPH_INDEX (FreeRDP rejects
+		// HIT-only); paint the cached tile, then decode any sections on top.
+		if glyphIndex < 0 {
+			slog.Warn("CLEAR: GLYPH_HIT without GLYPH_INDEX")
+			return
+		}
+		cached := ctx.glyphCache[glyphIndex]
+		if cached == nil || len(cached) != w*h*4 {
+			// FreeRDP errors out on a hit against an empty/undersized entry.
+			slog.Warn("CLEAR: glyph hit without cached entry", "idx", glyphIndex, "cached", cached != nil)
+			return
+		}
+		copy(out, cached)
+	}
+
+	if glyphIndex < 0 && glyphFlags&clearFlagGlyphHit == 0 && len(data) < off+12 {
+		slog.Warn("CLEAR: payload too short for counts", "len", len(data))
+		return
+	}
+	if len(data) < off+12 {
+		// GLYPH_HIT(+INDEX) frames may end right after the glyph header.
+		return
+	}
+	residualLen := int(binary.LittleEndian.Uint32(data[off:]))
+	bandsLen := int(binary.LittleEndian.Uint32(data[off+4:]))
+	subcodecLen := int(binary.LittleEndian.Uint32(data[off+8:]))
+	off += 12
 
 	if residualLen > 0 {
 		if off+residualLen <= len(data) {
@@ -2561,6 +2640,16 @@ func (ctx *clearCodecCtx) decodeIntoBuf(data []byte, w, h int, out []byte) {
 		} else {
 			slog.Warn("CLEAR: subcodec section out of bounds, skipped", "subcodecLen", subcodecLen, "off", off, "len", len(data))
 		}
+	}
+
+	// GLYPH_INDEX: store the composed tile so later HIT frames can reuse it.
+	if glyphIndex >= 0 && w*h <= clearGlyphMaxTilePix {
+		entry := ctx.glyphCache[glyphIndex]
+		if entry == nil || len(entry) != w*h*4 {
+			entry = make([]byte, w*h*4)
+			ctx.glyphCache[glyphIndex] = entry
+		}
+		copy(entry, out)
 	}
 }
 
