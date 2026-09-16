@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall/js"
 	"time"
 
@@ -68,15 +69,63 @@ func main() {
 		return strings.Join(parts, ",")
 	}))
 
+	// Stall watchdog: after lock/logon-screen transitions Windows Server
+	// sometimes stops serving a connection entirely — no frames, input
+	// ignored — while TCP/WS stay open ("zombie": page shows Connected but
+	// nothing ever updates).  A second connection to the same session works
+	// fine, so recovery = detect the stall and reconnect.  Signal: no frames
+	// for 15s → nudge with a mouse move; two consecutive nudges that produce
+	// zero frames → reconnect.  At most one auto-reconnect per 90s.
+	go func() {
+		nudges := 0
+		lastReconnect := time.Now().Add(-90 * time.Second)
+		for {
+			time.Sleep(5 * time.Second)
+			clientMu.Lock()
+			c := rdpClient
+			clientMu.Unlock()
+			if c == nil {
+				nudges = 0
+				continue
+			}
+			silent := time.Since(time.UnixMilli(lastFrameAtMs.Load()))
+			if silent < 15*time.Second {
+				nudges = 0
+				continue
+			}
+			c.MouseMove(640, 400)
+			nudges++
+			time.Sleep(9 * time.Second)
+			if time.Since(time.UnixMilli(lastFrameAtMs.Load())) < 10*time.Second {
+				nudges = 0 // nudge produced frames — alive
+				continue
+			}
+			if nudges >= 2 && time.Since(lastReconnect) > 90*time.Second {
+				slog.Warn("watchdog: connection stalled (no frames), reconnecting")
+				setStatusText("Stalled — reconnecting…")
+				jsDisconnect(js.Undefined(), nil)
+				lastReconnect = time.Now()
+				nudges = 0
+				if len(lastConnectArgs) >= 8 {
+					go jsConnect(js.Undefined(), lastConnectArgs)
+				}
+			}
+		}
+	}()
+
 	// Block forever — JS callbacks keep things alive.
 	select {}
 }
 
 // jsConnect is called from JS: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height, swapAltMeta[, noGfx])
+var lastConnectArgs []js.Value
+
 func jsConnect(_ js.Value, args []js.Value) any {
 	if len(args) < 8 {
 		return fmt.Sprintf("usage: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height[, swapAltMeta[, noGfx]])")
 	}
+	lastConnectArgs = args
+	touchFrame()
 	proxyWsURL := args[0].String()
 	host := args[1].String()
 	port := args[2].String()
@@ -198,6 +247,7 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	})
 
 	g.OnH264Raw(func(destX, destY, w, h int, isKey bool, data []byte) {
+		touchFrame()
 		jsArr := js.Global().Get("Uint8Array").New(len(data))
 		js.CopyBytesToJS(jsArr, data)
 		js.Global().Call("rdpOnH264", destX, destY, w, h, isKey, jsArr)
@@ -347,9 +397,16 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 
 var renderedBitmaps int64
 
+// lastFrameAtMs tracks the most recent visual frame (bitmap or H.264) — the
+// stall watchdog uses it to detect connections the server has gone silent on.
+var lastFrameAtMs atomic.Int64
+
+func touchFrame() { lastFrameAtMs.Store(time.Now().UnixMilli()) }
+
 var renderedIconRegion int64
 
 func renderBitmaps(bs []grdp.Bitmap) {
+	touchFrame()
 	renderedBitmaps += int64(len(bs))
 	for _, bm := range bs {
 		if bm.DestLeft < 300 && bm.DestTop < 200 {
