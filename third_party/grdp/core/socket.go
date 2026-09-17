@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
+	"log/slog"
 	"math/big"
 	"net"
 	"time"
@@ -95,6 +96,9 @@ func (s *SocketLayer) StartTLS() error {
 		return err
 	}
 	s.tlsConn = tlsConn
+	slog.Warn("RDP TLS established", "version", tlsConn.ConnectionState().Version,
+		"cipher", tlsConn.ConnectionState().CipherSuite,
+		"peerCerts", len(tlsConn.ConnectionState().PeerCertificates))
 	// Reset the buffered reader to read from the TLS connection.
 	// Reset discards any unconsumed buffered bytes from the plain-text phase,
 	// which is correct because the TLS handshake has already consumed them.

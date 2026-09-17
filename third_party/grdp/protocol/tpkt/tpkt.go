@@ -283,6 +283,11 @@ func (t *TPKT) recvPubKeyInc(data []byte) error {
 	} else {
 		expected := credsspBindingHash(nlaServerClientHashMagic, t.clientNonce, tlsPubKey)
 		if !bytes.Equal(decrypted, expected) {
+			// Byte-level forensics at Warn level: wasm/native divergence on
+			// this exact check is otherwise invisible.
+			slog.Warn("CredSSP pubkey hash mismatch", "tlsPubKey", core.Hex(tlsPubKey),
+				"decrypted", core.Hex(decrypted), "expected", core.Hex(expected),
+				"clientNonce", core.Hex(t.clientNonce))
 			return fmt.Errorf("NLA: server public key hash mismatch (MITM or protocol bug)")
 		}
 	}

@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/nakagami/grdp"
 	"github.com/nakagami/grdp/plugin/rdpsnd"
+	"github.com/nakagami/grdp/protocol/nla"
 )
 
 var (
@@ -39,6 +41,9 @@ func (consoleWriter) Write(p []byte) (int, error) {
 }
 
 func main() {
+	nla.NTLMDebugDump = func(stage string, payload []byte) {
+		js.Global().Get("console").Call("log", "[ntlm] "+stage+" "+hex.EncodeToString(payload))
+	}
 	if h := js.Global().Get("console"); !h.IsUndefined() {
 		slog.SetDefault(slog.New(slog.NewTextHandler(consoleWriter{}, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	}

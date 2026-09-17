@@ -305,6 +305,10 @@ type NTLMv2 struct {
 // SetHost sets the CredSSP target host name (used for the MsvAvTargetName av-pair)
 func (n *NTLMv2) SetHost(h string) { n.host = h }
 
+// NTLMDebugDump, when set, receives the wire bytes of each NTLM message
+// (negotiate/challenge/authenticate) for handshake diffing between builds.
+var NTLMDebugDump func(stage string, payload []byte)
+
 func NewNTLMv2(domain, user, password string) *NTLMv2 {
 	return &NTLMv2{
 		domain:    domain,
@@ -328,6 +332,11 @@ func (n *NTLMv2) GetNegotiateMessage() *NegotiateMessage {
 		NTLMSSP_REQUEST_TARGET |
 		NTLMSSP_NEGOTIATE_UNICODE
 	n.negotiateMessage = negoMsg
+	if NTLMDebugDump != nil {
+		buff := &bytes.Buffer{}
+		struc.Pack(buff, negoMsg)
+		NTLMDebugDump("negotiate", buff.Bytes())
+	}
 	return n.negotiateMessage
 }
 
@@ -387,6 +396,9 @@ var (
 
 func (n *NTLMv2) GetAuthenticateMessage(s []byte) (*AuthenticateMessage, *NTLMv2Security) {
 	slog.Debug("GetAuthenticateMessage", "s", s)
+	if NTLMDebugDump != nil {
+		NTLMDebugDump("challenge", s)
+	}
 
 	challengeMsg := &ChallengeMessage{totalLen: len(s)}
 	r := bytes.NewReader(s)
@@ -448,6 +460,9 @@ func (n *NTLMv2) GetAuthenticateMessage(s []byte) (*AuthenticateMessage, *NTLMv2
 
 	if computeMIC {
 		copy(n.authenticateMessage.MIC[:], MIC(exportedSessionKey, n.negotiateMessage, n.challengeMessage, n.authenticateMessage)[:16])
+	}
+	if NTLMDebugDump != nil {
+		NTLMDebugDump("authenticate", n.authenticateMessage.Serialize())
 	}
 
 	md := md5.New()

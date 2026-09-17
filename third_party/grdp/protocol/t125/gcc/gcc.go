@@ -266,6 +266,15 @@ type ClientCoreData struct {
 
 func NewClientCoreData(kbdLayout uint32, keyboardType uint32, keyboardSubType uint32) *ClientCoreData {
 	name, _ := os.Hostname()
+	// js/wasm os.Hostname returns "()" — some RDP servers behave differently
+	// toward clients with a degenerate name (observed: different NTLM
+	// challenge flags).  Use a sane fallback.
+	if name == "" || name == "()" {
+		name = "web-rdp-client"
+	}
+	if v := os.Getenv("RDP_FAKE_HOSTNAME"); v != "" {
+		name = v
+	}
 	var ClientName [32]byte
 	copy(ClientName[:], core.UnicodeEncode(name)[:])
 	return &ClientCoreData{

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"image"
 	"image/color"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nakagami/grdp"
+	"github.com/nakagami/grdp/protocol/nla"
 )
 
 var start = time.Now()
@@ -27,6 +29,11 @@ func main() {
 	domain := ""
 	if len(os.Args) > 4 {
 		domain = os.Args[4]
+	}
+	if os.Getenv("RDP_DUMP_NTLM") != "" {
+		nla.NTLMDebugDump = func(stage string, payload []byte) {
+			fmt.Println("[ntlm]", stage, hex.EncodeToString(payload))
+		}
 	}
 	c := grdp.NewRdpClient(host, 1280, 800, func(addr string) (net.Conn, error) { return net.DialTimeout("tcp", addr, 10*time.Second) })
 	// Mirror the page's AVC-advertisement path (the wasm build registers OnH264Raw,
