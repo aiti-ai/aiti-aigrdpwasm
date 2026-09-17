@@ -62,18 +62,22 @@ func main() {
 		data, _ := os.ReadFile(filepath.Join(dir, n))
 		parts := strings.Split(strings.TrimSuffix(n, ".bin"), "-")
 		kind := parts[2]
-		var left, top int
+		var left, top, w, h int
 		fmt.Sscanf(parts[3], "%d", &left)
 		fmt.Sscanf(parts[4], "%d", &top)
+		fmt.Sscanf(parts[5], "%dx%d", &w, &h)
 		switch kind {
 		case "clear":
-			sess.DecodeInto(data, surf, W, H, left, top)
+			sess.DecodeInto(data, w, h, surf, W, H, left, top)
 		default:
 			prog.DecodeInto(data, surf, W, H)
 		}
 		f := i + 1
 		if f >= from && f <= to {
 			writeBMP(filepath.Join(outDir, fmt.Sprintf("f%03d.bmp", f)), surf)
+		}
+		if from < 0 && kind == "clear" {
+			writeBMP(filepath.Join(outDir, fmt.Sprintf("clear-%03d.bmp", f)), surf)
 		}
 	}
 	fmt.Println("done")

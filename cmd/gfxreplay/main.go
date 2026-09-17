@@ -108,7 +108,7 @@ func main() {
 		h, _ := strconv.Atoi(wh[1])
 		switch kind {
 		case "clear":
-			clearSess.DecodeInto(data, surf, W, H, left, top)
+			clearSess.DecodeInto(data, w, h, surf, W, H, left, top)
 		case "prog":
 			progSess.DecodeInto(data, surf, W, H)
 		case "wts2":

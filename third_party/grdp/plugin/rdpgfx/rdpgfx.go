@@ -264,8 +264,8 @@ type ClearSession struct {
 // DecodeInto decodes one ClearCodec payload onto the surface region at
 // (left,top) — same compositing semantics as the live path (tile base =
 // current surface pixels, result written back).
-func (s *ClearSession) DecodeInto(payload []byte, surf []byte, surfW, surfH, left, top int) {
-	s.ctx.decodeInto(payload, surfW, surfH, surf, surfW, surfH, left, top)
+func (s *ClearSession) DecodeInto(payload []byte, w, h int, surf []byte, surfW, surfH, left, top int) {
+	s.ctx.decodeInto(payload, w, h, surf, surfW, surfH, left, top)
 }
 
 // NewClearSession creates a ClearCodec session with persistent cache state.
@@ -2844,7 +2844,12 @@ func (ctx *clearCodecCtx) decodeBands(data []byte, surfW int, out []byte) {
 					return
 				}
 				fullEntry = &ctx.vBarStorage[idx]
-				if len(fullEntry.pixels) < vBarHeight*3 {
+				// FreeRDP parity: dummy-fill ONLY a never-allocated slot
+				// (clear.c: vBarEntry->size == 0).  An entry with cached
+				// content of ANY height keeps its pixels — wiping them here
+				// replaced real cache content with flat background and
+				// striped the unlock-transition frames.
+				if len(fullEntry.pixels) == 0 {
 					fullEntry.count = vBarHeight
 					fullEntry.pixels = make([]byte, vBarHeight*3)
 					for y := 0; y < vBarHeight; y++ {
@@ -2898,10 +2903,19 @@ func (ctx *clearCodecCtx) decodeBands(data []byte, surfW int, out []byte) {
 
 			if fullEntry.count != vBarHeight {
 				fullEntry.count = vBarHeight
-				if cap(fullEntry.pixels) < vBarHeight*3 {
-					fullEntry.pixels = make([]byte, vBarHeight*3)
+				need := vBarHeight * 3
+				// FreeRDP parity: realloc PRESERVES the cached bytes (clear.c
+				// resize_vbar_entry).  A zeroing make() on growth destroyed
+				// cached pixels for entries last used with a shorter height.
+				if cap(fullEntry.pixels) < need {
+					grown := make([]byte, need)
+					copy(grown, fullEntry.pixels)
+					fullEntry.pixels = grown
 				} else {
-					fullEntry.pixels = fullEntry.pixels[:vBarHeight*3]
+					if len(fullEntry.pixels) < need {
+						fullEntry.pixels = fullEntry.pixels[:cap(fullEntry.pixels)]
+					}
+					fullEntry.pixels = fullEntry.pixels[:need]
 				}
 			}
 
