@@ -3,8 +3,8 @@
 package main
 
 import (
-	"errors"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -483,43 +483,11 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	// verified trigger; the reconnect tile-desync it was meant to heal is
 	// rarer than the stall it caused.
 
-	// Auto-unlock: if the server shows an interactive logon UI after NLA
-	// (Windows Server 2022 dockurr container does this even with
-	// INFO_AUTOLOGON), send the password as keyboard input to complete
-	// interactive logon.  If the session is LOCKED instead ("Press
-	// Ctrl+Alt+Delete"), the plain password keystrokes are swallowed — the
-	// SAS must go first — so later attempts prepend Ctrl+Alt+Del.  A session
-	// already sitting at the desktop gets stray keystrokes; that is the
-	// accepted cost of a blind unlock (kept for the container boot flow).
-	go func() {
-		// Two PLAIN password attempts (4s: interactive-logon password field;
-		// 12s: slow logon screen).  No blind CAD retries — on an unlocked
-		// desktop CAD locks the session / opens the security screen and the
-		// typed password lands in whatever has focus.  Locked sessions are
-		// handled by the one-click 🔓 unlock (rdpUnlock) or ⚡ → Ctrl+Alt+Del.
-		password := []int{0x14, 0x12, 0x1F, 0x14, 0x02, 0x03, 0x04, 0x1C}
-		for _, delay := range []time.Duration{4 * time.Second, 12 * time.Second} {
-			time.Sleep(delay)
-			if stale() {
-				return
-			}
-			for _, sc := range password {
-				if stale() {
-					return
-				}
-				g.KeyDown(sc)
-				time.Sleep(60 * time.Millisecond)
-				g.KeyUp(sc)
-				time.Sleep(60 * time.Millisecond)
-			}
-			setStatusText("Connected (auto-unlock sent)")
-			time.Sleep(800 * time.Millisecond)
-			if stale() {
-				return
-			}
-			g.MouseMove(640, 400)
-		}
-	}()
+	// NOTE: blind auto-typing of the password was REMOVED (2026-09-18).
+	// It typed into whatever had focus — on an already-logged-in desktop
+	// that meant stray input the remote user sees as bugs (search boxes,
+	// random apps).  Locked sessions: use the page toolbar 🔓 button
+	// (rdpUnlock: SAS + password + Enter, user-gated).
 	return nil
 }
 
