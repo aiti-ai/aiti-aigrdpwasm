@@ -51,6 +51,7 @@ func main() {
 	js.Global().Set("rdpKeyDown", js.FuncOf(jsKeyDown))
 	js.Global().Set("rdpKeyUp", js.FuncOf(jsKeyUp))
 	js.Global().Set("rdpClipboardChanged", js.FuncOf(jsClipboardChanged))
+	js.Global().Set("rdpUnlock", js.FuncOf(jsUnlock))
 	js.Global().Set("rdpStats", js.FuncOf(func(_ js.Value, _ []js.Value) any {
 		clientMu.Lock()
 		c := rdpClient
@@ -79,15 +80,28 @@ func main() {
 	go func() {
 		nudges := 0
 		lastReconnect := time.Now().Add(-90 * time.Second)
+		hadClient := false
 		for {
 			time.Sleep(5 * time.Second)
 			clientMu.Lock()
 			c := rdpClient
 			clientMu.Unlock()
 			if c == nil {
+				// Connection object gone: either never connected, or the WS
+				// closed (rdpOnClose → jsDisconnect).  Reconnect after a
+				// previous session existed — covers server-side closes that
+				// the fixed-timer flow would otherwise leave dead.
+				if hadClient && len(lastConnectArgs) >= 8 && time.Since(lastReconnect) > 90*time.Second {
+					slog.Warn("watchdog: connection closed, reconnecting")
+					setStatusText("Reconnecting…")
+					lastReconnect = time.Now()
+					hadClient = false
+					go jsConnect(js.Undefined(), lastConnectArgs)
+				}
 				nudges = 0
 				continue
 			}
+			hadClient = true
 			silent := time.Since(time.UnixMilli(lastFrameAtMs.Load()))
 			if silent < 15*time.Second {
 				nudges = 0
@@ -120,11 +134,95 @@ func main() {
 // jsConnect is called from JS: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height, swapAltMeta[, noGfx])
 var lastConnectArgs []js.Value
 
+var lastPassword string
+
+// domCodeForChar maps a printable ASCII char to its DOM code for jsCodeToRDP.
+func domCodeForChar(ch byte) string {
+	switch {
+	case ch >= 'a' && ch <= 'z':
+		return "Key" + string(ch-32)
+	case ch >= 'A' && ch <= 'Z':
+		return "Key" + string(ch)
+	case ch >= '0' && ch <= '9':
+		return "Digit" + string(ch)
+	}
+	switch ch {
+	case ' ':
+		return "Space"
+	case '.':
+		return "Period"
+	case ',':
+		return "Comma"
+	case '-':
+		return "Minus"
+	case '_':
+		return "Underscore"
+	case '/':
+		return "Slash"
+	case ';':
+		return "Semicolon"
+	case '=':
+		return "Equal"
+	case '\\':
+		return "Backslash"
+	case '`':
+		return "Backquote"
+	case '[':
+		return "BracketLeft"
+	case ']':
+		return "BracketRight"
+	case '\'':
+		return "Quote"
+	}
+	return ""
+}
+
+// jsUnlock is called from JS: rdpUnlock() — one-click locked-session
+// recovery: Ctrl+Alt+Del (SAS brings up the password field), then the
+// stored password, then Enter.  User-gated (toolbar 🔓 button), so it
+// never fires blind against an unlocked desktop.
+func jsUnlock(_ js.Value, _ []js.Value) any {
+	clientMu.Lock()
+	c := rdpClient
+	clientMu.Unlock()
+	if c == nil {
+		return "not connected"
+	}
+	const lctrl, lalt, del = 0x1D, 0x38, 0xE053
+	go func() {
+		c.KeyDown(lctrl)
+		c.KeyDown(lalt)
+		c.KeyDown(del)
+		time.Sleep(120 * time.Millisecond)
+		c.KeyUp(del)
+		c.KeyUp(lalt)
+		c.KeyUp(lctrl)
+		time.Sleep(2500 * time.Millisecond) // secure-screen transition
+		// type the stored password (scan via keymap) then Enter
+		for _, ch := range lastPassword {
+			code := jsCodeToRDP(domCodeForChar(byte(ch)), false)
+			if code == 0 {
+				continue
+			}
+			c.KeyDown(code)
+			time.Sleep(60 * time.Millisecond)
+			c.KeyUp(code)
+			time.Sleep(60 * time.Millisecond)
+		}
+		c.KeyDown(0x1C)
+		time.Sleep(60 * time.Millisecond)
+		c.KeyUp(0x1C)
+		setStatusText("Unlock sequence sent")
+	}()
+	return "unlock sequence started"
+}
+
 func jsConnect(_ js.Value, args []js.Value) any {
 	if len(args) < 8 {
 		return fmt.Sprintf("usage: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height[, swapAltMeta[, noGfx]])")
 	}
 	lastConnectArgs = args
+	lastPassword = args[5].String()
 	touchFrame()
 	proxyWsURL := args[0].String()
 	host := args[1].String()
@@ -353,27 +451,16 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	// already sitting at the desktop gets stray keystrokes; that is the
 	// accepted cost of a blind unlock (kept for the container boot flow).
 	go func() {
-		// t e s t 1 2 3 Enter (Set 1 scancodes; 0x14='t' — 0x2C is 'z')
+		// Two PLAIN password attempts (4s: interactive-logon password field;
+		// 12s: slow logon screen).  No blind CAD retries — on an unlocked
+		// desktop CAD locks the session / opens the security screen and the
+		// typed password lands in whatever has focus.  Locked sessions are
+		// handled by the one-click 🔓 unlock (rdpUnlock) or ⚡ → Ctrl+Alt+Del.
 		password := []int{0x14, 0x12, 0x1F, 0x14, 0x02, 0x03, 0x04, 0x1C}
-		const lctrl, lalt, del = 0x1D, 0x38, 0xE053
-		type attempt struct {
-			delay time.Duration
-			cad   bool
-		}
-		for _, a := range []attempt{{4 * time.Second, false}, {20 * time.Second, true}, {45 * time.Second, true}} {
-			time.Sleep(a.delay)
+		for _, delay := range []time.Duration{4 * time.Second, 12 * time.Second} {
+			time.Sleep(delay)
 			if stale() {
 				return
-			}
-			if a.cad {
-				g.KeyDown(lctrl)
-				g.KeyDown(lalt)
-				g.KeyDown(del)
-				time.Sleep(120 * time.Millisecond)
-				g.KeyUp(del)
-				g.KeyUp(lalt)
-				g.KeyUp(lctrl)
-				time.Sleep(2500 * time.Millisecond) // logon screen transition
 			}
 			for _, sc := range password {
 				if stale() {
