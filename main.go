@@ -97,12 +97,12 @@ func main() {
 					// closed (rdpOnClose → jsDisconnect).  Reconnect after a
 					// previous session existed — covers server-side closes that
 					// the fixed-timer flow would otherwise leave dead.
-					if hadClient && len(lastConnectArgs) >= 8 && time.Since(lastReconnect) > 90*time.Second {
-						slog.Warn("watchdog: connection closed, reconnecting")
+					if hadClient && time.Since(lastReconnect) > 90*time.Second {
+						slog.Warn("watchdog: connection closed, recovering")
 						setStatusText("Reconnecting…")
 						lastReconnect = time.Now()
 						hadClient = false
-						go jsConnect(js.Undefined(), lastConnectArgs)
+						recoverConnection("closed")
 					}
 					nudges = 0
 					return
@@ -121,9 +121,11 @@ func main() {
 					return
 				}
 				if nudges >= 2 && time.Since(lastReconnect) > 90*time.Second {
-					slog.Warn("watchdog: connection stalled (no frames), reconnecting")
+					slog.Warn("watchdog: connection stalled (no frames), recovering")
 					setStatusText("Stalled — reconnecting…")
-					jsDisconnect(js.Undefined(), nil)
+					lastReconnect = time.Now()
+					nudges = 0
+					recoverConnection("stalled")
 					lastReconnect = time.Now()
 					nudges = 0
 					if len(lastConnectArgs) >= 8 {
@@ -140,6 +142,28 @@ func main() {
 
 // jsConnect is called from JS: rdpConnect(proxyWsURL, host, port, domain, user, password, width, height, swapAltMeta[, noGfx])
 var lastConnectArgs []js.Value
+
+// pageOwnsRecovery reports whether the page handles reconnection itself
+// (aiti-ui-env deployments inject __rdpTarget and reload on close with
+// stored credentials).  A Go-side reconnect would then race the page's own
+// reload: two concurrent connections hit the server's single-session limit
+// and the loser gets a TLS alert — a connect/close storm.
+func pageOwnsRecovery() bool {
+	return js.Global().Get("__rdpTarget").Truthy()
+}
+
+func recoverConnection(reason string) {
+	if pageOwnsRecovery() {
+		slog.Warn("watchdog: " + reason + " — reloading page (page owns recovery)")
+		setStatusText("Stalled — reloading…")
+		js.Global().Get("location").Call("reload")
+		return
+	}
+	if len(lastConnectArgs) >= 8 {
+		slog.Warn("watchdog: " + reason + " — reconnecting")
+		go jsConnect(js.Undefined(), lastConnectArgs)
+	}
+}
 
 var lastPassword string
 
