@@ -3,12 +3,12 @@
 package main
 
 import (
-	"sort"
-	"strings"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall/js"
@@ -83,47 +83,54 @@ func main() {
 		hadClient := false
 		for {
 			time.Sleep(5 * time.Second)
-			clientMu.Lock()
-			c := rdpClient
-			clientMu.Unlock()
-			if c == nil {
-				// Connection object gone: either never connected, or the WS
-				// closed (rdpOnClose → jsDisconnect).  Reconnect after a
-				// previous session existed — covers server-side closes that
-				// the fixed-timer flow would otherwise leave dead.
-				if hadClient && len(lastConnectArgs) >= 8 && time.Since(lastReconnect) > 90*time.Second {
-					slog.Warn("watchdog: connection closed, reconnecting")
-					setStatusText("Reconnecting…")
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Warn("watchdog: recovered from nudge panic", "err", r)
+					}
+				}()
+				clientMu.Lock()
+				c := rdpClient
+				clientMu.Unlock()
+				if c == nil {
+					// Connection object gone: either never connected, or the WS
+					// closed (rdpOnClose → jsDisconnect).  Reconnect after a
+					// previous session existed — covers server-side closes that
+					// the fixed-timer flow would otherwise leave dead.
+					if hadClient && len(lastConnectArgs) >= 8 && time.Since(lastReconnect) > 90*time.Second {
+						slog.Warn("watchdog: connection closed, reconnecting")
+						setStatusText("Reconnecting…")
+						lastReconnect = time.Now()
+						hadClient = false
+						go jsConnect(js.Undefined(), lastConnectArgs)
+					}
+					nudges = 0
+					return
+				}
+				hadClient = true
+				silent := time.Since(time.UnixMilli(lastFrameAtMs.Load()))
+				if silent < 15*time.Second {
+					nudges = 0
+					return
+				}
+				c.MouseMove(640, 400)
+				nudges++
+				time.Sleep(9 * time.Second)
+				if time.Since(time.UnixMilli(lastFrameAtMs.Load())) < 10*time.Second {
+					nudges = 0 // nudge produced frames — alive
+					return
+				}
+				if nudges >= 2 && time.Since(lastReconnect) > 90*time.Second {
+					slog.Warn("watchdog: connection stalled (no frames), reconnecting")
+					setStatusText("Stalled — reconnecting…")
+					jsDisconnect(js.Undefined(), nil)
 					lastReconnect = time.Now()
-					hadClient = false
-					go jsConnect(js.Undefined(), lastConnectArgs)
+					nudges = 0
+					if len(lastConnectArgs) >= 8 {
+						go jsConnect(js.Undefined(), lastConnectArgs)
+					}
 				}
-				nudges = 0
-				continue
-			}
-			hadClient = true
-			silent := time.Since(time.UnixMilli(lastFrameAtMs.Load()))
-			if silent < 15*time.Second {
-				nudges = 0
-				continue
-			}
-			c.MouseMove(640, 400)
-			nudges++
-			time.Sleep(9 * time.Second)
-			if time.Since(time.UnixMilli(lastFrameAtMs.Load())) < 10*time.Second {
-				nudges = 0 // nudge produced frames — alive
-				continue
-			}
-			if nudges >= 2 && time.Since(lastReconnect) > 90*time.Second {
-				slog.Warn("watchdog: connection stalled (no frames), reconnecting")
-				setStatusText("Stalled — reconnecting…")
-				jsDisconnect(js.Undefined(), nil)
-				lastReconnect = time.Now()
-				nudges = 0
-				if len(lastConnectArgs) >= 8 {
-					go jsConnect(js.Undefined(), lastConnectArgs)
-				}
-			}
+			}()
 		}
 	}()
 
@@ -377,6 +384,11 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 		js.Global().Call("rdpOnError", e.Error())
 	}).OnClose(func() {
 		slog.Debug("rdp close")
+		clientMu.Lock()
+		if rdpClient == g {
+			rdpClient = nil // let the watchdog's reconnect path engage
+		}
+		clientMu.Unlock()
 		if stale() {
 			return
 		}
@@ -529,7 +541,7 @@ func renderBitmaps(bs []grdp.Bitmap) {
 					dst[col*4+0] = src[col*4+2] // R ← BGRA[2]
 					dst[col*4+1] = src[col*4+1] // G
 					dst[col*4+2] = src[col*4+0] // B ← BGRA[0]
-					dst[col*4+3] = 0xFF        // A (forced opaque: NSCodec/AVC paths leave alpha=0 → transparent holes)
+					dst[col*4+3] = 0xFF         // A (forced opaque: NSCodec/AVC paths leave alpha=0 → transparent holes)
 				}
 			}
 		} else {
@@ -546,7 +558,7 @@ func renderBitmaps(bs []grdp.Bitmap) {
 		js.CopyBytesToJS(jsArr, rgba)
 		imageData := imageDataCtor.New(jsArr, w, h)
 		ctx2d.Call("putImageData", imageData, bm.DestLeft, bm.DestTop)
-		}
+	}
 }
 
 func jsDisconnect(_ js.Value, _ []js.Value) any {
