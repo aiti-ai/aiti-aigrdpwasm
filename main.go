@@ -57,6 +57,7 @@ func main() {
 	js.Global().Set("rdpKeyUp", js.FuncOf(jsKeyUp))
 	js.Global().Set("rdpClipboardChanged", js.FuncOf(jsClipboardChanged))
 	js.Global().Set("rdpUnlock", js.FuncOf(jsUnlock))
+	js.Global().Set("rdpRedraw", js.FuncOf(jsRedraw))
 	js.Global().Set("rdpStats", js.FuncOf(func(_ js.Value, _ []js.Value) any {
 		clientMu.Lock()
 		c := rdpClient
@@ -211,6 +212,23 @@ func domCodeForChar(ch byte) string {
 		return "Quote"
 	}
 	return ""
+}
+
+// jsRedraw is called from JS: rdpRedraw() — force the server to re-render
+// the full desktop (RDPEDISP resolution wobble).  Heals the reconnect
+// tile-desync: the server's graphics state persists across RDP connections
+// of the same session, so a fresh client's first render can omit tiles the
+// server believes unchanged from the previous connection.
+func jsRedraw(_ js.Value, _ []js.Value) any {
+	clientMu.Lock()
+	c := rdpClient
+	clientMu.Unlock()
+	if c == nil {
+		return "not connected"
+	}
+	c.RedrawDesktop()
+	setStatusText("Full redraw requested")
+	return "redraw requested"
 }
 
 // jsUnlock is called from JS: rdpUnlock() — one-click locked-session
@@ -475,13 +493,44 @@ func connect(proxyWsURL, host, port, domain, user, password string, width, heigh
 	rdpClient = g
 	clientMu.Unlock()
 
-	// NOTE: the RDPEDISP full-desktop redraw (RedrawDesktop) is currently
-	// DISABLED for auto-fire.  Fixed-time or settle-triggered wobbles both
-	// correlated with the pipeline stalling at zero frames (reproducible:
-	// fast connect → wobble mid-setup → server render never arrives), and
-	// sessions went input-dead shortly after.  Re-enable only behind a
-	// verified trigger; the reconnect tile-desync it was meant to heal is
-	// rarer than the stall it caused.
+	// Full-desktop redraw after the initial render settles.  The server's
+	// graphics state persists across RDP reconnects of the same Windows
+	// session, so its first render can omit tiles it believes unchanged from
+	// the previous connection — the user sees permanent blue/black patches.
+	// Trigger: bitmap stream goes quiet for 5s (initial render done), then
+	// one RDPEDISP wobble forces the server to repaint everything.
+	// (Must NOT fire during the initial render — a layout change mid-burst
+	// resets the pipeline and stalls it at zero frames.  The quiet-period
+	// detection prevents that; the 90s deadline is the failsafe.)
+	go func() {
+		deadline := time.Now().Add(90 * time.Second)
+		var last int64 = -1
+		quiet := 0
+		for {
+			if stale() {
+				return
+			}
+			n := renderedBitmaps
+			if n > 0 && n == last {
+				quiet++
+				if quiet >= 5 { // 5 polls × 1s = 5s of silence
+					break
+				}
+			} else {
+				quiet = 0
+			}
+			last = n
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if stale() {
+			return
+		}
+		slog.Info("auto-heal: render settled, forcing full redraw")
+		g.RedrawDesktop()
+	}()
 
 	// NOTE: blind auto-typing of the password was REMOVED (2026-09-18).
 	// It typed into whatever had focus — on an already-logged-in desktop
