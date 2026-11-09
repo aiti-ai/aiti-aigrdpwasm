@@ -63,7 +63,8 @@
     "KeyQ KeyW KeyE KeyR KeyT KeyY KeyU KeyI KeyO KeyP BracketLeft BracketRight Backslash",
     "KeyA KeyS KeyD KeyF KeyG KeyH KeyJ KeyK KeyL Semicolon Quote {enter}",
     "{shift} KeyZ KeyX KeyC KeyV KeyB KeyN KeyM Comma Period Slash {shift}",
-    "{meta} {space} {arrowleft} {arrowup} {arrowdown} {arrowright} {home} {end} {pageup} {pagedown}"
+    "{meta} {space} {arrowleft} {arrowup} {arrowdown} {arrowright} {home} {end} {pageup} {pagedown}",
+    "F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12"
   ];
   const UPPER_ROWS = [
     "{esc} {tab} {ctrl} {alt} {shift} {bksp} {delete} {capslock}",
@@ -71,7 +72,8 @@
     "UQ UW UE UR UT UY UU UI UO UP BraceLeft BraceRight Pipe",
     "UA US UD UF UG UH UJ UK UL Colon DoubleQuote {enter}",
     "{shift} UZ UX UC UV UB UN UM LessThan GreaterThan Question {shift}",
-    "{meta} {space} {arrowleft} {arrowup} {arrowdown} {arrowright} {home} {end} {pageup} {pagedown}"
+    "{meta} {space} {arrowleft} {arrowup} {arrowdown} {arrowright} {home} {end} {pageup} {pagedown}",
+    "F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12"
   ];
 
   /* ── display map (single global map) ─────────────────────────────── */
@@ -95,6 +97,7 @@
     BraceLeft: "{", BraceRight: "}", Pipe: "|", Colon: ":", DoubleQuote: "\"",
     LessThan: "<", GreaterThan: ">", Question: "?"
   });
+  for (let i = 1; i <= 12; i++) DISPLAY["F" + i] = "F" + i; // F1-F12: display same as code (same on both layers)
 
   /* ── value -> code ────────────────────────────────── */
   function resolveCode(value) {

@@ -21,12 +21,25 @@
   const DEFAULT_COMBOS = [
     { label: "Ctrl+Alt+T", codes: ["ControlLeft", "AltLeft", "KeyT"] },
     { label: "Alt+Tab", codes: ["AltLeft", "Tab"] },
+    { label: "Ctrl+Alt+Del", codes: ["ControlLeft", "AltLeft", "Delete"] },
     { label: "⊞ Win", codes: ["MetaLeft"] },
     { label: "Ctrl+C", codes: ["ControlLeft", "KeyC"] },
     { label: "Ctrl+V", codes: ["ControlLeft", "KeyV"] },
     { label: "Ctrl+Z", codes: ["ControlLeft", "KeyZ"] },
     { label: "Ctrl+S", codes: ["ControlLeft", "KeyS"] },
     { label: "F5", codes: ["F5"] },
+    { label: "F1", codes: ["F1"] },
+    { label: "F2", codes: ["F2"] },
+    { label: "F3", codes: ["F3"] },
+    { label: "F4", codes: ["F4"] },
+    { label: "F6", codes: ["F6"] },
+    { label: "F7", codes: ["F7"] },
+    { label: "F8", codes: ["F8"] },
+    { label: "F9", codes: ["F9"] },
+    { label: "F10", codes: ["F10"] },
+    { label: "F11", codes: ["F11"] },
+    { label: "F12", codes: ["F12"] },
+    { label: "⇧+F10", codes: ["ShiftLeft", "F10"] }, // Windows/Linux context menu (Shift+F10)
     { label: "Esc", codes: ["Escape"] },
     { label: "PrtSc", codes: ["PrintScreen"] }
   ];
