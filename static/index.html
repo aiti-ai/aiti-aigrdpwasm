@@ -486,7 +486,7 @@
     // ships the wasm for jsDelivr distribution, but postinstall removes the local copy —
     // same idea as the service-tunnels face-api model).
     // Override: URL ?wasm=<url> or localStorage['grdpwasm.wasmUrl']; default CDN -> same-origin fallback.
-    const PKG_VERSION = "0.2.0";
+    const PKG_VERSION = "0.2.1";
     function wasmSources() {
       const custom = new URLSearchParams(location.search).get("wasm")
         || localStorage.getItem("grdpwasm.wasmUrl");
