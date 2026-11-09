@@ -3,10 +3,10 @@
   "version": "0.2.1",
   "description": "Web-based RDP client (Go WASM + WebSocket proxy) — browser assets; main.wasm fetched from CDN at runtime via justget",
   "license": "GPL-3.0",
-  "homepage": "https://github.com/nakagami/grdpwasm",
+  "homepage": "https://github.com/aiti-ai/aiti-aigrdpwasm#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nakagami/grdpwasm.git"
+    "url": "git+https://github.com/aiti-ai/aiti-aigrdpwasm.git"
   },
   "files": [
     "static/",
@@ -24,5 +24,6 @@
   },
   "devDependencies": {
     "esbuild": "^0.28.2"
-  }
+  },
+  "bugs": "https://github.com/aiti-ai/aiti-aigrdpwasm/issues"
 }
