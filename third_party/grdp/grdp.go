@@ -786,6 +786,18 @@ func (g *RdpClient) handleRedirect(redir *pdu.ServerRedirectionPDU) {
 // connections of the same session, so its initial render can omit tiles it
 // believes unchanged from the previous connection (missing taskbar / stale
 // patches on the fresh client).
+// RequestRefresh asks the server to resend the full desktop content via the
+// SuppressOutput off→on toggle.  Unlike a bare mouse move, a live server
+// always responds with output updates even on a completely static desktop,
+// so the stall watchdog can use this as a liveness probe without
+// misreading an idle session as a dead one.
+func (g *RdpClient) RequestRefresh() {
+	if g.pdu == nil || !g.eventReady.Load() {
+		return
+	}
+	g.pdu.SendForceRefresh(uint16(g.width), uint16(g.height))
+}
+
 func (g *RdpClient) RedrawDesktop() {
 	if g.dispHandler == nil {
 		return

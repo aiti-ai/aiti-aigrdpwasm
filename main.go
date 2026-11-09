@@ -120,6 +120,13 @@ func main() {
 					return
 				}
 				c.MouseMove(640, 400)
+				// Force a frame: a static desktop legitimately produces no
+				// output, so a mouse-move nudge alone can't distinguish idle
+				// from stalled — the server would stay silent and the next
+				// check would falsely trigger recovery.  The refresh probe
+				// makes a live server resend content (frames → lastFrameAtMs
+				// advances); only a real zombie stays silent through it.
+				c.RequestRefresh()
 				nudges++
 				time.Sleep(9 * time.Second)
 				if time.Since(time.UnixMilli(lastFrameAtMs.Load())) < 10*time.Second {
