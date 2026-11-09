@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <link rel="icon" href="data:,">
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>grdpwasm — Web RDP Client</title>
@@ -69,6 +70,11 @@
       display: block;
       cursor: none;
       outline: none;
+      /* small screens: scale the canvas to the container width (aspect ratio kept) so a
+         phone sees the whole desktop; pinch-zoom still zooms in. Mouse coords are
+         rescaled accordingly. */
+      max-width: 100%;
+      height: auto;
     }
 
     /* ── virtual keyboard (small screens / touch devices) ────────────────────────── */
@@ -83,6 +89,40 @@
     }
     #vkbToggle:hover { background: #1b4a7e; }
     #vkbToggle.on { background: #2ecc71; color: #111; }
+    /* ── shortcut bar (holding a chip presses the combo in order; release fires in reverse) ── */
+    #scbToggle {
+      background: #0f3460;
+      color: #eee;
+      border: 1px solid #444;
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #scbToggle:hover { background: #1b4a7e; }
+    #scbToggle.on { background: #e94560; color: #fff; }
+    #shortcuts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 5px 12px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+    }
+    #shortcuts[hidden] { display: none; }
+    .scb-chip {
+      background: #0f3460;
+      color: #cfd8e3;
+      border: 1px solid #2c4a77;
+      border-radius: 14px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    .scb-chip.scb-on { background: #e94560; color: #fff; border-color: #ff8fa3; }
     #sysKbBtn { background: #0f3460; color: #eee; border: 1px solid #444; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; }
     #sysKbBtn:hover { background: #1b4a7e; }
     #sysKbBtn.on { background: #3498db; color: #111; }
@@ -104,13 +144,13 @@
 </head>
 <body>
   <script>
-    // ── fixedTarget mode ─────────────────────────────────────────────
-    // The target address is controlled by the server (__rdpTarget injected by
-    // rdp-bridge); the frontend must not be able to tamper with it.
-    // Enters fixedTarget mode (hides host/port) when ANY of:
+    // ── fixedTarget mode ──────────────────────────────────────────────
+    // The target address is controlled by the server (rdp-bridge injects __rdpTarget);
+    // the front end cannot tamper with it. FixedTarget mode (host/port hidden) is
+    // triggered when either:
     //   1. __rdpTarget exists (injected by rdp-bridge)
-    //   2. URL param ?fixedTarget=true (explicit opt-in)
-    // Neither present = standalone mode: show host/port for free-form connections.
+    //   2. URL param ?fixedTarget=true (explicit)
+    // Neither present = standalone mode: host/port fields shown for free connection.
     (function () {
       var isFixed = !!(window.__rdpTarget && window.__rdpTarget.host)
         || /[?&]fixedTarget=true/.test(location.search);
@@ -134,12 +174,16 @@
       <input type="checkbox" id="swapAltMeta" />
       Swap Alt/Meta
     </label>
-    <!-- xrdp compat is fully automatic: detected via the server's bitmap-codecs capability set, no manual toggle -->
+    <!-- xrdp compat is fully automatic now: detected via the server bitmap-codecs capability set -->
     <button id="connectBtn" onclick="toggleConnect()">Connect</button>
+    <button id="scbToggle" title="Shortcut bar (F1–F12 / Alt+Tab / Ctrl+Alt+T / ⊞ Win / ⇧+F10 …)">⚡</button>
     <button id="vkbToggle" title="Virtual keyboard (touch / small screens)">⌨️</button>
     <button id="sysKbBtn" title="System keyboard (native)">⌨️Sys</button>
+    <button id="unlockBtn" title="Unlock: send Ctrl+Alt+Del → auto-type password → Enter (click this when the lock screen shows)" style="display:none">🔓</button>
+    <button id="redrawBtn" title="Force a full server redraw (heals missing patches / blank regions)" style="display:none">🔄</button>
     <span id="status">Loading WASM…</span>
   </div>
+  <div id="shortcuts" hidden></div>
   <div id="vkbRoot" class="vkb-hidden-root"></div>
   <input id="nativeKbInput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
   <div id="canvasWrapper">
@@ -265,13 +309,6 @@
         },
         error(e) {
           console.warn('WebCodecs H.264 decoder error:', e);
-          // A failed H.264 stream never recovers by itself (broken reference
-          // frames) and leaves the screen garbled. Fall back to noGfx mode
-          // (legacy bitmap rendering, always works) after repeated errors.
-          window.__avcErr = (window.__avcErr || 0) + 1;
-          if (window.__avcErr >= 3 && connected) {
-            reloadNoGfx('WebCodecs H.264 decoder failed ' + window.__avcErr + 'x');
-          }
         }
       });
       decoder.configure({
@@ -285,7 +322,6 @@
 
     // Called from Go/WASM with raw H.264 NAL unit data.
     function rdpOnH264(destX, destY, w, h, isKey, uint8Data) {
-      window.__h264Seen = (window.__h264Seen || 0) + 1;
       if (!h264Dec || h264Dec.state === 'closed') return;
       h264Timestamp += 1000; // 1 ms apart (decoder uses μs)
       h264FramePos.set(h264Timestamp, { x: destX, y: destY });
@@ -414,12 +450,11 @@
         console.warn('Unsupported cursor xorBpp:', xorBpp);
       }
 
-      // Mitigation: xrdp color cursors ship an all-zero AND mask -> the whole
-      // rectangle is fully opaque and the cursor shape's (arrow/busy/text…)
-      // transparent outline is lost, rendering as a black block. A real cursor
-      // always has transparent areas (at least the four corners), so detect
-      // "opaque ratio >= 95%" -> discard that cursor and keep the previous
-      // (or default) one.
+      // Mitigation: xrdp color cursors can come with an all-zero AND mask -> the whole
+      // rectangle is fully opaque, the cursor shape's (arrow/spinner/text) transparent
+      // outline is lost and it renders as a black block. A real cursor always has
+      // transparent areas (at least the corners); detect ">=95% opaque" and drop that
+      // cursor, keeping the previous (or default) one.
       {
         let opaque = 0, total = w * h;
         for (let o = 3; o < px.length; o += 4) if (px[o] !== 0) opaque++;
@@ -447,23 +482,24 @@
     }
 
     // ── WASM bootstrap ────────────────────────────────────────────────────────
-    // At runtime main.wasm is race-downloaded from CDNs via justget (the npm tarball
-    // ships the wasm so jsDelivr can serve it, but postinstall removes the local copy
-    // after install — same approach as service-tunnels' face-api models).
+    // At runtime main.wasm is race-downloaded from CDNs via justget (the package tarball
+    // ships the wasm for jsDelivr distribution, but postinstall removes the local copy —
+    // same idea as the service-tunnels face-api model).
     // Override: URL ?wasm=<url> or localStorage['grdpwasm.wasmUrl']; default CDN -> same-origin fallback.
     const PKG_VERSION = "0.2.0";
     function wasmSources() {
       const custom = new URLSearchParams(location.search).get("wasm")
         || localStorage.getItem("grdpwasm.wasmUrl");
       if (custom) return [custom];
-      // Same-origin first: bridge/pi-web deployments always serve a freshly
-      // deployed main.wasm next to this page.  The CDN copies (npm package)
-      // can lag behind and silently run a stale decoder, so they are the
-      // fallback, not the primary source.
+      // CDN first (release convention: publish to npmjs after debugging; the CDN then
+      // serves the latest). Until published it 404s -> same-origin main.wasm fallback.
+      // ⚠️ Before publishing, PKG_VERSION must be bumped together with package.json
+      // (prepack syncs it via scripts/sync-version.mjs), otherwise the CDN keeps an
+      // old decoder and the page silently runs the stale wasm.
       return [
         `https://cdn.jsdelivr.net/npm/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
         `https://unpkg.com/@aiti-ai/grdpwasm@${PKG_VERSION}/static/main.wasm`,
-        "main.wasm", // 同源兜底（未发布期间 CDN 404 落到这里）
+        "main.wasm",
       ];
     }
     async function fetchPlain(url) {
@@ -478,13 +514,13 @@
       let bytes;
       if (window.justget && window.justget.download && /^https?:/.test(url)) {
         try {
-          // justget: multi-mirror racing + localStorage learned cache (fastest source becomes primary next time)
+          // justget: multi-mirror racing + localStorage learning cache (fastest source wins next time)
           const result = await window.justget.download({ url, mirrors: cdnMirrors });
           bytes = result.data instanceof Blob ? new Uint8Array(await result.data.arrayBuffer()) : result.data;
         } catch { /* all CDNs failed -> same-origin fallback below */ }
       }
       if (!bytes) {
-        // try every source sequentially (incl. same-origin main.wasm; CDN sources are retried once — they fail fast)
+        // try every source one by one (same-origin main.wasm included; CDN sources get one retry, they fail fast)
         let lastErr;
         for (const u of [url, ...mirrors]) {
           try { bytes = await fetchPlain(u); break; } catch (e) { lastErr = e; }
@@ -499,9 +535,18 @@
       document.getElementById("status").textContent = "WASM load failed: " + e;
     });
 
+    const ub = document.getElementById("unlockBtn");
+    if (ub) ub.addEventListener("click", () => {
+      if (typeof rdpUnlock === "function") { rdpUnlock(); setStatus("Unlock sequence sent"); }
+    });
+    const rb = document.getElementById("redrawBtn");
+    if (rb) rb.addEventListener("click", () => {
+      if (typeof rdpRedraw === "function") { rdpRedraw(); setStatus("Full redraw requested…"); }
+    });
+
     function proxyURL() {
-      // Derive the base path of the current page (e.g. /aiti-ui-env/rdp or /dev/aiti-ui-env/rdp)
-      // so the WS connects to <same base>/ws?target=... (rewritten by the pi-web middleware to rdp-bridge)
+      // Derive the base path the page lives under (e.g. /aiti-ui-env/rdp or /dev/aiti-ui-env/rdp)
+      // so the WS connects to /ws under the same base (rewritten to rdp-bridge by the pi-web middleware).
       const base = location.pathname.endsWith("/index.html")
         ? location.pathname.slice(0, -"/index.html".length)
         : location.pathname;
@@ -517,9 +562,9 @@
       }
     }
 
-    async function doConnect() {
+    function doConnect() {
       // host/port: injected by the server via __rdpTarget (fixedTarget mode);
-      // standalone mode reads them from hidden DOM fields (invisible & read-only to the user)
+      // standalone mode reads hidden DOM fields (invisible and non-editable for the user)
       const host = (window.__rdpTarget && window.__rdpTarget.host) || document.getElementById("host").value.trim();
       const port = String((window.__rdpTarget && window.__rdpTarget.port) || document.getElementById("port").value.trim() || 3389);
       const domain   = document.getElementById("domain").value.trim();
@@ -529,38 +574,17 @@
       const height   = parseInt(document.getElementById("height").value) || 800;
 
       saveCookies();
+      try { sessionStorage.setItem("grdp.creds", JSON.stringify({ domain, user, password, width, height })); } catch (_) {}
 
       // (Re)create the H.264 decoder sized for this session.
-      // Probe ACTUAL decode support first: headless browsers may expose the
-      // WebCodecs API yet ship no H.264 codec — every AVC420 frame would then
-      // fail at runtime ("Operation is not supported"), the surface would
-      // never receive its keyframes, and the screen would stay garbled. When
-      // H.264 is unusable we connect in noGfx mode so the server falls back to
-      // legacy bitmap/ClearCodec-only rendering, which always works.
-      let avcUsable = false;
-      if (h264Supported()) {
-        try {
-          const sup = await VideoDecoder.isConfigSupported({ codec: 'avc1.42E01E', codedWidth: width, codedHeight: height });
-          avcUsable = !!sup.supported;
-        } catch (_) { avcUsable = false; }
-      }
       if (h264Dec) { try { h264Dec.close(); } catch (_) {} }
-      h264Dec = avcUsable ? createH264Decoder(width, height) : null;
+      h264Dec = createH264Decoder(width, height);
       h264Timestamp = 0;
       h264FramePos.clear();
 
       // Reset cursor state for the new session.
       pointerCache.clear();
       canvas.style.cursor = 'default';
-
-      // Size the canvas backing store up-front and paint an opaque background.
-      // ClearCodec/RDPGFX frames are incremental; regions never covered must
-      // stay opaque (transparent holes render as garbage on some browsers).
-      canvas.width = width;
-      canvas.height = height;
-      ctx2d = canvas.getContext('2d');
-      ctx2d.fillStyle = '#000000';
-      ctx2d.fillRect(0, 0, width, height);
 
       // Create AudioContext here, while we're in a user-gesture handler,
       // so the browser starts it in 'running' state (no autoplay suspension).
@@ -572,150 +596,77 @@
       } else {
         document.getElementById("status").textContent = "Connecting… (WebCodecs unavailable)";
       }
-      // Debug: ?nogfx=1 disables the EGFX pipeline (server falls back to
-      // legacy bitmap PDUs) — used to isolate graphics-pipeline issues.
-      const urlNoGfx = new URLSearchParams(location.search).has("nogfx");
       rdpConnect(proxyURL(), host, port, domain, user, password, width, height,
-        document.getElementById("swapAltMeta").checked, urlNoGfx || !avcUsable);
+        document.getElementById("swapAltMeta").checked);
     }
 
     // Callbacks from WASM
     function rdpOnReady() {
+      try { sessionStorage.setItem("grdp.reconnects", "0"); } catch (_) {}
       connected = true;
       const btn = document.getElementById("connectBtn");
       btn.textContent = "Disconnect";
+      const ub = document.getElementById("unlockBtn");
+      if (ub) ub.style.display = "";
+      const rb = document.getElementById("redrawBtn");
+      if (rb) rb.style.display = "";
       btn.classList.add("connected");
       document.getElementById("status").textContent =
         h264Dec ? "Connected (WebCodecs H.264)" : "Connected";
       document.getElementById("rdpCanvas").focus();
-      startGfxQualityWatchdog();
     }
 
-    // ── Automatic noGFX fallback watchdog ─────────────────────────────────────
-    // The AVC420 capability profile does not work reliably with every server:
-    // a server may answer with dual-stream AVC444 (chroma garbling on a
-    // single-stream WebCodecs decoder) or switch to sparse ClearCodec
-    // incrementals (desktop never fully materialises). Both leave the screen
-    // unusable without any decoder error ever firing. Sample the canvas once
-    // after the session had time to render; if it still looks broken,
-    // transparently reload in noGFX mode (legacy bitmap rendering) — no user
-    // action required. Armed only in AVC420 sessions on non-nogfx pages so
-    // the fallback itself never loops.
-    function reloadNoGfx(reason) {
-      if (/[?&]nogfx=1/.test(location.search)) return false;
-      console.warn('gfx quality watchdog:', reason, '— reloading in noGFX (legacy bitmap) mode');
-      // Stash credentials for the seamless auto-reconnect after the reload
-      // (sessionStorage: cleared when the tab closes, never persisted).
-      try {
-        sessionStorage.setItem('rdpAutoFallbackCreds', JSON.stringify({
-          u: document.getElementById('user').value,
-          p: document.getElementById('password').value,
-        }));
-      } catch (_) {}
-      const sep = location.search ? location.search + '&nogfx=1' : '?nogfx=1';
-      location.href = location.pathname + sep;
-      return true;
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
     }
-
-    function startGfxQualityWatchdog() {
-      if (!h264Dec || /[?&]nogfx=1/.test(location.search)) return;
-      setTimeout(() => {
-        if (!connected) return;
-        const c = document.getElementById('rdpCanvas');
-        if (!c) return;
-        const ctx = c.getContext('2d');
-        let d;
-        try { d = ctx.getImageData(0, 0, c.width, c.height).data; } catch (_) { return; }
-        const colors = new Set();
-        let greenMagenta = 0, grey = 0, sampled = 0;
-        for (let j = 0; j < d.length; j += 16) { // sample every 4th pixel
-          const r = d[j], g = d[j+1], b = d[j+2];
-          colors.add((r<<16)|(g<<8)|b);
-          sampled++;
-          // Saturated pure green / magenta = classic dual-stream YUV mismatch
-          if ((g > 180 && r < 80 && b < 80) || (r > 180 && b > 180 && g < 80)) greenMagenta++;
-          // (128,128,128) = the logon-desktop placeholder grey: when progressive
-          // (RFX) frames are garbled/dropped the body never gets painted and
-          // only sparse ClearCodec incrementals cover small deltas.
-          if (r === 128 && g === 128 && b === 128) grey++;
-        }
-        const gmPct = sampled ? greenMagenta / sampled : 0;
-        const h264Seen = window.__h264Seen || 0;
-        if (gmPct > 0.25) {
-          reloadNoGfx('saturated green/magenta on ' + Math.round(gmPct*100) + '% of pixels (dual-stream chroma mismatch)');
-          return;
-        }
-        const greyPct = sampled ? grey / sampled : 0;
-        if (greyPct > 0.4) {
-          reloadNoGfx('logon-placeholder grey on ' + Math.round(greyPct*100) + '% of pixels (progressive/RFX decode failure)');
-          return;
-        }
-        // Declared AVC420 but not a single H.264 frame arrived: the server
-        // answered the caps with a non-AVC profile (sparse ClearCodec
-        // incrementals) whose coverage never materialises a full desktop.
-        // A healthy AVC session always delivers at least the initial
-        // keyframe within this window.
-        if (h264Seen === 0) {
-          // With AUTOLOGON, Windows Server 2022 renders the desktop via
-          // ClearCodec (no H.264 at all). Don't downgrade just because
-          // h264Seen=0 — check whether ClearCodec actually delivered
-          // content: >1500 distinct colors means the desktop is rendering.
-          // The login process takes 30-40s (logonInfoV2 → desktop), so the
-          // window is 45s.
-          if (colors.size < 1500) {
-            reloadNoGfx('AVC420 session produced no H.264 frames and only ' + colors.size + ' colors in 45s (ClearCodec not rendering)');
-            return;
-          }
-          console.log('gfx quality watchdog: ClearCodec-only OK (' + colors.size + ' colors, no H.264 but desktop rendering)');
-          return;
-        }
-        console.log('gfx quality watchdog: OK (' + colors.size + ' colors, h264 frames: ' + h264Seen + ')');
-      }, 45000);
-    }
-
     function rdpOnError(msg) {
       setDisconnected("Error: " + msg);
+      scheduleAutoReconnect();
     }
-
-    // Seamless auto-reconnect after the noGFX fallback reload: if the
-    // watchdog stashed credentials, refill the form and connect immediately
-    // (no user action needed for the whole AVC420 → legacy downgrade).
-    try {
-      const fallbackCreds = sessionStorage.getItem('rdpAutoFallbackCreds');
-      if (fallbackCreds && /[?&]nogfx=1/.test(location.search)) {
-        sessionStorage.removeItem('rdpAutoFallbackCreds');
-        const creds = JSON.parse(fallbackCreds);
-        const userEl = document.getElementById('user');
-        const passEl = document.getElementById('password');
-        if (userEl && passEl && creds.u) {
-          userEl.value = creds.u;
-          passEl.value = creds.p || '';
-          // The WASM runtime injects rdpConnect asynchronously ("Ready" is set
-          // right after go.run) — wait for it, a blind 300ms timer races the
-          // multi-megabyte instantiation and throws "rdpConnect is not a
-          // function".
-          (async () => {
-            for (let i = 0; i < 150; i++) {
-              if (typeof window.rdpConnect === 'function' &&
-                  (document.getElementById('status')||{}).textContent === 'Ready') break;
-              await new Promise(r => setTimeout(r, 200));
-            }
-            if (typeof window.rdpConnect === 'function') doConnect();
-          })();
-        }
-      }
-    } catch (_) {}
 
     function rdpOnClose() {
-      // A server-side drop on an AVC420 session (frame-ack stalls, codec
-      // profile disagreements) does not recover on retry with the same
-      // profile. Reconnect once in noGFX mode automatically; in noGFX mode
-      // already (or user-initiated Disconnect), just report.
-      if (connected && !/[?&]nogfx=1/.test(location.search) && reloadNoGfx('server closed an AVC420 session')) {
+      setDisconnected("Closed");
+      scheduleAutoReconnect();
+    }
+
+    // Auto-recovery on disconnect: in autoconnect mode (bridge/server dropped, lock-screen
+    // kick, ...) reload the whole page after 4s — credentials live in sessionStorage and
+    // are re-filled + reconnected after reload. A backstop beyond the Go-side watchdog
+    // covering every disconnect shape.
+    var reconnectTimer = null;
+    function scheduleAutoReconnect() {
+      let creds = null;
+      try { creds = JSON.parse(sessionStorage.getItem("grdp.creds") || "null"); } catch (_) {}
+      if (!creds || !creds.user) return;
+      if (reconnectTimer) return;
+      // Retry cap: at most 3 auto-reconnects per page lifetime (a successful connect does
+      // NOT reset the counter — otherwise a "connects then instantly drops" loop never
+      // ends). Past the cap a persistent error message is shown.
+      let n = 0;
+      try { n = parseInt(sessionStorage.getItem("grdp.reconnects") || "0"); } catch (_) {}
+      if (n >= 3) {
+        setStatus("Disconnected (3 retries exhausted). Likely causes: wrong password, session taken over elsewhere (single-session limit), or the target refused the connection. Check credentials and press Connect manually.");
         return;
       }
-      setDisconnected("Closed");
+      try { sessionStorage.setItem("grdp.reconnects", String(n + 1)); } catch (_) {}
+      setStatus("Reconnecting… (attempt " + (n + 1) + "/3)");
     }
+    // load-time restore: prefill from sessionStorage when the form is empty
+    // and a fixed target is present (aiti-ui-env deployments).
+    (function restoreCreds() {
+      let creds = null;
+      try { creds = JSON.parse(sessionStorage.getItem("grdp.creds") || "null"); } catch (_) { return; }
+      if (!creds || !creds.user) return;
+      const tryFill = () => {
+        const u = document.getElementById("user"), p = document.getElementById("password");
+        if (!u || !p) { setTimeout(tryFill, 300); return; }
+        if (!u.value) u.value = creds.user;
+        if (!p.value) p.value = creds.password;
+        const d = document.getElementById("domain");
+        if (d && !d.value && creds.domain) d.value = creds.domain;
+      };
+      tryFill();
+    })();
 
     // Server → client: write text to browser clipboard (text only).
     function rdpOnClipboard(text) {
@@ -728,21 +679,33 @@
 
     function setDisconnected(msg) {
       connected = false;
-      if (typeof vkb !== "undefined") vkb.reset(); // release locked modifiers
+      if (typeof vkb !== "undefined") vkb.reset(); // release latched modifiers
+      if (typeof scb !== "undefined") scb.release(); // release any held shortcut-bar combo
       if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; audioNextAt = 0; }
       if (h264Dec) { try { h264Dec.close(); } catch (_) {} h264Dec = null; }
       h264FramePos.clear();
       const btn = document.getElementById("connectBtn");
       btn.textContent = "Connect";
       btn.classList.remove("connected");
+      const ub = document.getElementById("unlockBtn");
+      if (ub) ub.style.display = "none";
+      const rb = document.getElementById("redrawBtn");
+      if (rb) rb.style.display = "none";
       document.getElementById("status").textContent = msg;
     }
 
     // Mouse / keyboard events
+    // When the canvas is CSS-scaled, convert viewport coords back to remote pixel coords
+    function canvasRemoteXY(e) {
+      const r = canvas.getBoundingClientRect();
+      const sx = canvas.width / r.width;
+      const sy = canvas.height / r.height;
+      return [Math.floor((e.clientX - r.left) * sx), Math.floor((e.clientY - r.top) * sy)];
+    }
     canvas.addEventListener("mousemove", e => {
       if (!connected) return;
-      const r = canvas.getBoundingClientRect();
-      rdpMouseMove(Math.floor(e.clientX - r.left), Math.floor(e.clientY - r.top));
+      const [x, y] = canvasRemoteXY(e);
+      rdpMouseMove(x, y);
     });
 
     canvas.addEventListener("mousedown", e => {
@@ -751,14 +714,16 @@
       canvas.focus();
       const r = canvas.getBoundingClientRect();
       // grdp button: 0=left, 1=middle, 2=right  (JS: 0=left, 1=middle, 2=right)
-      rdpMouseDown(e.button, Math.floor(e.clientX - r.left), Math.floor(e.clientY - r.top));
+      const [mx, my] = canvasRemoteXY(e);
+      rdpMouseDown(e.button, mx, my);
     });
 
     canvas.addEventListener("mouseup", e => {
       if (!connected) return;
       e.preventDefault();
       const r = canvas.getBoundingClientRect();
-      rdpMouseUp(e.button, Math.floor(e.clientX - r.left), Math.floor(e.clientY - r.top));
+      const [ux, uy] = canvasRemoteXY(e);
+      rdpMouseUp(e.button, ux, uy);
     });
 
     canvas.addEventListener("wheel", e => {
@@ -801,7 +766,7 @@
       sysKbActive = !sysKbActive;
       sysKbBtn.classList.toggle("on", sysKbActive);
       if (sysKbActive) {
-        // open system keyboard: focus the hidden input; mobile pops up the native keyboard
+        // open the system keyboard: focus the hidden input; mobile pops the native keyboard
         nativeInput.value = "";
         nativeInput.focus();
       } else {
@@ -809,12 +774,12 @@
       }
     });
 
-    // forward native keyboard input to RDP
+    // Forward native-keyboard input to RDP
     nativeInput.addEventListener("input", () => {
       if (!connected || !sysKbActive) return;
       const text = nativeInput.value;
       if (!text) return;
-      // send characters to RDP one by one
+      // send to RDP char by char
       for (let i = 0; i < text.length; i++) {
         const ch = text[i];
         const code = charToKeyCode(ch);
@@ -823,10 +788,10 @@
           rdpKeyUp(code);
         }
       }
-      nativeInput.value = ""; // clear for the next character
+      nativeInput.value = ""; // clear, ready for the next char
     });
 
-    // char -> DOM code mapping (common chars; falls back when missing)
+    // char -> DOM code map (common chars, falls through when missing)
     function charToKeyCode(ch) {
       const map = {
         'a':'KeyA','b':'KeyB','c':'KeyC','d':'KeyD','e':'KeyE','f':'KeyF','g':'KeyG',
@@ -873,13 +838,14 @@
     });
   </script>
 
-  <!-- Virtual keyboard (simple-keyboard engine + programmer layout + unified dispatch layer) -->
+  <!-- virtual keyboard (simple-keyboard engine + programmer layout + unified dispatch layer) -->
   <script src="vendor/simple-keyboard.js"></script>
   <script src="virtual-keyboard.js"></script>
+  <script src="shortcut-bar.js"></script>
   <script>
     (function () {
       if (typeof SimpleKeyboard === "undefined" || typeof VirtualKeyboard === "undefined") return;
-      // mount: send to RDP (Go globals rdpKeyDown/rdpKeyUp map DOM codes to scancodes)
+      // mount: send to RDP (Go globals rdpKeyDown/rdpKeyUp map DOM code -> scancode)
       const vkb = VirtualKeyboard.mount({
         root: "#vkbRoot",
         onKey(code, down) {
@@ -901,6 +867,26 @@
           const el = document.getElementById("vkbRoot");
           document.body.style.setProperty("--vkb-hpx", el.offsetHeight + "px");
         }
+      });
+    })();
+  </script>
+
+  <!-- shortcut bar (F1–F12 / Alt+Tab / Ctrl+Alt+T / ⊞ Win / ⇧+F10 …; sent to RDP via the same dispatch layer as the virtual keyboard) -->
+  <script>
+    (function () {
+      if (typeof ShortcutBar === "undefined") return;
+      const scb = ShortcutBar.mount({
+        root: "#shortcuts",
+        onPress(code) { if (!connected) return; rdpKeyDown(code); },
+        onRelease(code) { if (!connected) return; rdpKeyUp(code); }
+      });
+      window.scb = scb;
+      const btn = document.getElementById("scbToggle");
+      const el = document.getElementById("shortcuts");
+      btn.addEventListener("click", () => {
+        el.hidden = !el.hidden;
+        btn.classList.toggle("on", !el.hidden);
+        if (el.hidden) scb.release(); // release held combos when collapsed
       });
     })();
   </script>
