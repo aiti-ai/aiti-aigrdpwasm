@@ -1,0 +1,90 @@
+# publish-npm.yml — publish @aiti-ai/grdpwasm to the npm official registry
+# (registry.npmjs.org). Single-package variant of the aiti-ai/aiti-ai
+# publish-npm.yml decision matrix: this repo ships one package, so the
+# content-hash skip / auto-bump machinery is unnecessary — the version is
+# bumped manually on release.
+#
+# Trigger: workflow_dispatch (manual)
+#   dry_run: true (default) — preflight + version check + pack with tarball
+#   verification (wasm present, magic bytes, postinstall stripping safety);
+#   false — publish for real.
+#
+# Auth: NPM_TOKEN secret (granular automation token, packages read/write on
+# the @aiti-ai scope) — written into ~/.npmrc by setup-node.
+# Upgrade path (token-free): npmjs Trusted Publishing (OIDC) — bind the
+# package on npmjs.com to this repo + workflow file, then publish with
+# --provenance and drop the NPM_TOKEN env. Kept as a comment until the
+# package exists on npmjs (first publish still needs a token).
+
+name: NPM Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preflight + pack verification, no publish)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  id-token: write # npm provenance (official publishes carry --provenance once Trusted Publishing is bound)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org" # writes ~/.npmrc with NODE_AUTH_TOKEN
+
+      - name: Preflight — registry identity
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Version consistency — package.json vs index.html PKG_VERSION
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          HTML=$(node -e "console.log(require('fs').readFileSync('static/index.html','utf8').match(/PKG_VERSION = \"([^\"]+)\"/)[1])")
+          echo "package.json=$PKG index.html=$HTML"
+          if [ "$PKG" != "$HTML" ]; then
+            echo "::error::PKG_VERSION in static/index.html does not match package.json ($HTML != $PKG) — run prepack (scripts/sync-version.mjs) and commit"
+            exit 1
+          fi
+
+      - name: Pack — tarball carries wasm with valid magic (postinstall strips only installed copies)
+        run: |
+          npm pack
+          TGZ=$(ls aiti-ai-grdpwasm-*.tgz)
+          tar -xzf "$TGZ" -O package/static/main.wasm > /tmp/main.wasm
+          SIZE=$(wc -c < /tmp/main.wasm)
+          MAGIC=$(head -c 4 /tmp/main.wasm | od -An -tx1 | tr -d ' ')
+          echo "tarball=$TGZ wasmBytes=$SIZE magic=$MAGIC"
+          if [ "$MAGIC" != "0061736d" ]; then
+            echo "::error::main.wasm magic bytes invalid ($MAGIC) — tarball must ship a real wasm for CDN distribution"
+            exit 1
+          fi
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::main.wasm too small ($SIZE bytes) — expected the ~10MB build"
+            exit 1
+          fi
+
+      - name: Publish
+        if: ${{ inputs.dry_run == 'false' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Trusted Publishing upgrade: drop NODE_AUTH_TOKEN, add --provenance
+        run: npm publish --access public
+
+      - name: Summary
+        run: |
+          echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_STEP_SUMMARY"
