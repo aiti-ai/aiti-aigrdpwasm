@@ -60,6 +60,20 @@ jobs:
             exit 1
           fi
 
+      # static/main.wasm is gitignored (built artifact), so npm pack can only
+      # ship it if CI builds it first — the Pack gate below would otherwise find
+      # an empty tarball member. Recipe mirrors the Makefile (make wasm_exec wasm).
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build wasm (Go -> wasm32, ships in the tarball for CDN)
+        run: |
+          make wasm_exec wasm
+          test -f static/main.wasm
+          test -f static/wasm_exec.js
+          ls -l static/main.wasm static/wasm_exec.js
+
       - name: Pack — tarball carries wasm with valid magic (postinstall strips only installed copies)
         run: |
           npm pack
