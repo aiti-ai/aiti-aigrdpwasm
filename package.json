@@ -1,6 +1,6 @@
 {
   "name": "@aiti-ai/grdpwasm",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Web-based RDP client (Go WASM + WebSocket proxy) — browser assets; main.wasm fetched from CDN at runtime via justget",
   "license": "GPL-3.0",
   "homepage": "https://github.com/aiti-ai/aiti-aigrdpwasm#readme",

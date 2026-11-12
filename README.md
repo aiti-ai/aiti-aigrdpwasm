@@ -10,11 +10,9 @@ Connect to a Windows Remote Desktop server directly from your browser — no plu
 > see [Updates in this fork](#updates-in-this-fork) below.
 > Published to npm as [`@aiti-ai/grdpwasm`](https://www.npmjs.com/package/@aiti-ai/grdpwasm).
 
-> **Availability**: current releases (`0.2.x`) are on the private registry —
-> `npm install @aiti-ai/grdpwasm --registry https://registry.npmjs.org`. npmjs.org publication is
-> prepared (`.github/workflows/publish-npm.yml`, two commands once NPM_TOKEN is set);
-> jsDelivr/unpkg CDN links become live at that point. Until then the wasm loads from the
-> same origin when served behind a backend (e.g. aiti-ui-env's rdp-bridge).
+> **Availability**: published to npm as [`@aiti-ai/grdpwasm`](https://www.npmjs.com/package/@aiti-ai/grdpwasm) —
+> `npm install @aiti-ai/grdpwasm`. jsDelivr/unpkg serve `main.wasm` straight from the npm tarball;
+> when served behind a backend (e.g. aiti-ui-env's rdp-bridge), the wasm loads same-origin.
 
 ## Updates in this fork
 
